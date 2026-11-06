@@ -234,6 +234,26 @@ class Crypto(BotTestCase):
         self.assertEqual(self.client.submit_order.call_count, 1)
 
 
+class OppositeIndexFunds(BotTestCase):
+    def ctx(self, held=(), pending=()):
+        return {"now": NOW, "equity": 100_000.0, "loss_hit": False, "minutes_to_close": 300,
+                "positions": {s: NS(symbol=s) for s in held}, "pending_symbols": set(pending), "exposure": 0.0}
+
+    def test_long_and_inverse_never_held_together(self):
+        row = NS(atr_14=1.0)
+        for symbol, ctx in (("PSQ", self.ctx(held=["QQQ"])), ("SH", self.ctx(pending=["SPY"])),
+                            ("QQQ", self.ctx(held=["SH"]))):
+            self.assertEqual(bot.try_enter(symbol, row, ctx), "skip: opposite index fund held (would cancel out)")
+        self.client.submit_order.assert_not_called()
+
+    def test_same_direction_and_stocks_are_not_blocked(self):
+        # reaching the quote fetch means the direction gate let it through
+        with mock.patch.object(bot, "latest_quote", side_effect=RuntimeError("reached quote")):
+            for symbol, held in (("PSQ", ["SH"]), ("AAPL", ["PSQ"]), ("QQQ", ["SPY"])):
+                with self.assertRaisesRegex(RuntimeError, "reached quote"):
+                    bot.try_enter(symbol, NS(atr_14=1.0), self.ctx(held=held))
+
+
 class StaleEntries(BotTestCase):
     def test_missing_timestamps_do_not_crash(self):
         now = datetime(2026, 11, 6, 15, tzinfo=timezone.utc)

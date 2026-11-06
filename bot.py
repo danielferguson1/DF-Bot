@@ -322,6 +322,13 @@ def cancel_stale_entries(orders, now: datetime) -> list:
     return pending
 
 
+def market_side(symbol: str) -> int:
+    """+1 long index fund (SPY, QQQ), -1 inverse fund (SH, PSQ), 0 anything else."""
+    if key(symbol) in config.INVERSE:
+        return -1
+    return 1 if sector(symbol) == "index" else 0
+
+
 def try_enter(symbol, row, ctx) -> str:
     """Run every risk gate, then submit the entry. Returns what happened (for the log)."""
     crypto = is_crypto(symbol)
@@ -337,6 +344,9 @@ def try_enter(symbol, row, ctx) -> str:
     sec = sector(symbol)
     if sum(sector(s) == sec for s in holdings) >= config.MAX_PER_SECTOR:
         return f"skip: sector cap ({sec})"
+    side = market_side(symbol)
+    if side and any(market_side(s) == -side for s in holdings):
+        return "skip: opposite index fund held (would cancel out)"
 
     quote = latest_quote(symbol)
     bid, ask = float(quote.bid_price), float(quote.ask_price)

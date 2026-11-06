@@ -22,6 +22,12 @@ def bars(closes, start="2026-11-02 10:00"):
     return pd.DataFrame({"open": c, "high": c + 0.5, "low": c - 0.5, "close": c, "volume": 1000.0})
 
 
+class Config(unittest.TestCase):
+    def test_every_symbol_has_a_sector_and_inverse_is_watched(self):
+        self.assertEqual(set(config.WATCHLIST + config.CRYPTO_WATCHLIST) - set(config.SECTORS), set())
+        self.assertLessEqual(config.INVERSE, set(config.WATCHLIST))
+
+
 class Indicators(unittest.TestCase):
     def test_rsi_flat_is_neutral_and_rising_is_100(self):
         self.assertEqual(strategy.add_indicators(bars([100] * 30))["rsi_14"].iloc[-1], 50)

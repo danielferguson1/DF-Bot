@@ -2,12 +2,12 @@
 from pathlib import Path
 from alpaca.data.enums import DataFeed
 
-WATCHLIST = ["AAPL", "MSFT", "NVDA", "TSLA", "SPY", "SH"]   # stocks: regular hours only
+WATCHLIST = ["AAPL", "MSFT", "NVDA", "TSLA", "SPY", "SH", "QQQ", "PSQ"]   # stocks: regular hours only
 CRYPTO_WATCHLIST = ["BTC/USD"]                             # 24/7; set to [] to turn crypto off
 SECTORS = {"AAPL": "tech", "MSFT": "tech", "NVDA": "tech", "TSLA": "auto", "SPY": "index", "SH": "index",
-           "BTC/USD": "crypto"}
+           "QQQ": "index", "PSQ": "index", "BTC/USD": "crypto"}
 REGIME_SYMBOL = "SPY"   # market regime = SPY above/below its session VWAP
-INVERSE = {"SH"}        # symbols that profit when REGIME_SYMBOL falls
+INVERSE = {"SH", "PSQ"} # symbols that profit when the market falls (traded only when SPY < VWAP)
 
 # Data: IEX is the free real-time feed. Switch to DataFeed.SIP if you pay for it.
 DATA_FEED = DataFeed.IEX
