@@ -53,15 +53,6 @@ USE_EARNINGS_CHECK = True
 EARNINGS_BLOCK_NEXT_DAY = False     # True also skips stocks reporting on the next trading day (only matters
                                     # if you hold overnight; stocks are flattened before the close)
 
-# Time machine: before each stock BUY, replay the plan (same stop/target in %) on the symbol's last
-# TM_DAYS of 5-minute bars: TM_REPLAYS simulated rest-of-days built from bars at the same time of day,
-# plus every real past session entered at the same time. Logged with each decision.
-USE_TIME_MACHINE = True
-TM_DAYS = 60
-TM_REPLAYS = 10_000
-TM_MIN_EXPECTED_R = None    # None = log only. A number (e.g. 0.0) skips BUYs whose simulated average R
-                            # is below it.
-
 # Morning scanner: once a day after the open, add Alpaca's most-active stocks to WATCHLIST.
 # Leveraged, inverse and short funds are excluded by name: the bot would trade them as plain longs.
 # Not backtestable (today's most-active list didn't exist in the past), so paper-test it before trusting it.
@@ -73,7 +64,7 @@ SCAN_MAX_PRICE = 1000.0     # must stay under MAX_POSITION_USD to buy at least 1
 SCAN_EXCLUDE_NAME = r"\b[23]x\b|ultra|leveraged|inverse|\bshort\b|\bbull\b|\bbear\b|warrant|\bunits?\b|\bright"
 
 # Stock strategy. "orb" = opening-range breakout on stocks in play (Zarattini, Barbon & Aziz 2023); the SMA/RSI
-# rules ("sma_rsi") then don't trade stocks, and WATCHLIST / scanner / time machine are not used for stocks.
+# rules ("sma_rsi") then don't trade stocks, and WATCHLIST / scanner are not used for stocks.
 # Crypto keeps its own rules either way.
 # Research (2 years, whole market, C:\Users\06dan\qwen-bot-research): no edge was proven that survives realistic
 # fills and costs. Run it on PAPER to measure real fills and slippage: python orb_report.py

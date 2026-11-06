@@ -41,7 +41,6 @@ import db
 import metrics
 import orb
 import strategy
-import timemachine
 
 load_dotenv()
 API_KEY, SECRET_KEY = os.getenv("ALPACA_API_KEY"), os.getenv("ALPACA_SECRET_KEY")
@@ -277,23 +276,6 @@ def earnings_block(symbol: str, ctx) -> str | None:
     return None
 
 
-# ---------- time machine ----------
-
-_tm_bars = {}  # (symbol, New York date) -> regular-hours 5-minute bars of the last TM_DAYS sessions
-
-
-def time_machine(symbol: str, entry: float, stop: float, target: float, now) -> dict | None:
-    k = (symbol, et(now).date())
-    if k not in _tm_bars:
-        raw = data_client.get_stock_bars(StockBarsRequest(
-            symbol_or_symbols=symbol, timeframe=TimeFrame(config.BAR_MINUTES, TimeFrameUnit.Minute),
-            start=now - timedelta(days=int(config.TM_DAYS * 1.5) + 7), end=et(now).normalize(),
-            feed=config.DATA_FEED)).df  # end at today's midnight: only past sessions are needed
-        _tm_bars[k] = strategy.regular_hours(raw.loc[symbol]) if symbol in raw.index.get_level_values(0) \
-            else raw.iloc[0:0]
-    return timemachine.run(_tm_bars[k], now, entry, stop, target, replays=config.TM_REPLAYS)
-
-
 # ---------- morning scanner ----------
 
 def scan_watchlist() -> list[str]:
@@ -503,8 +485,8 @@ def ensure_orb_stop(symbol: str):
         if (side == "long" and price <= stop) or (side == "short" and price >= stop):
             flatten(symbol)
             return "already past the stop: closed"
-        for o in stops:
-            trading_client.cancel_order_by_id(o.id)
+        if not cancel_and_wait(symbol, stops):
+            raise RuntimeError(f"old stop still open after cancel; {qty:g} covered by only {covered:g}")
         place_stop(symbol, qty, stop, exit_side, client_id=f"{ORB_STOP}{key(symbol)}-{uuid.uuid4().hex[:12]}")
         db.log("orders", symbol=key(symbol), side=exit_side.value, qty=qty, stop_price=stop,
                order_id=order_id, note="orb protective stop")
@@ -572,17 +554,25 @@ def protective_stop(orders):
     return (o.side, float(o.stop_price)) if o else (None, None)
 
 
+def cancel_and_wait(symbol: str, orders, seconds: float = 5) -> bool:
+    """Cancel `orders` and wait until Alpaca has released them: cancels are asynchronous, and until then the old
+    orders still reserve the shares, so a replacement or a close can be rejected. True if all are gone."""
+    ids = {str(o.id) for o in orders}
+    for o in orders:
+        trading_client.cancel_order_by_id(o.id)
+    for _ in range(int(seconds / 0.5)):
+        if not ids & {str(o.id) for o in open_orders(symbol)}:
+            return True
+        time.sleep(0.5)
+    return False
+
+
 def flatten(symbol: str):
     """Cancel open orders (they reserve the shares/coins), then close the position.
     If the close fails, put a stop back so the position is never left unprotected."""
     orders = open_orders(symbol)
     stop_side, stop_price = protective_stop(orders)
-    for o in orders:
-        trading_client.cancel_order_by_id(o.id)
-    for _ in range(10):
-        if not open_orders(symbol):
-            break
-        time.sleep(0.5)
+    cancel_and_wait(symbol, orders)  # if one lingers, close_position fails below and the stop is restored
     try:
         trading_client.close_position(key(symbol))
     except Exception as e:
@@ -774,19 +764,6 @@ def try_enter(symbol, row, ctx) -> str:
         return (f"skip: daily risk budget (today ${ctx['risk_today']:,.0f} + this ${risk:,.0f} "
                 f"> ${budget:,.0f})")
 
-    tm_note = ""
-    if not crypto and config.USE_TIME_MACHINE:
-        try:
-            tm = time_machine(symbol, ask, stop, target, ctx["now"])
-            tm_note = " | " + timemachine.describe(tm)
-        except Exception as e:
-            tm, tm_note = None, f" | TM failed ({type(e).__name__}: {e})"
-            if config.TM_MIN_EXPECTED_R is not None:
-                return "skip: time machine failed" + tm_note
-        if (config.TM_MIN_EXPECTED_R is not None and tm is not None
-                and tm["mc"]["avg_r"] < config.TM_MIN_EXPECTED_R):
-            return f"skip: time machine avg {tm['mc']['avg_r']:+.2f}R < {config.TM_MIN_EXPECTED_R:+.2f}R" + tm_note
-
     if config.USE_LLM_VETO:
         try:
             veto, reason = llm_news_veto(symbol, ctx["now"])
@@ -794,10 +771,9 @@ def try_enter(symbol, row, ctx) -> str:
             news_check_status(e)
             return f"skip: news check failed ({type(e).__name__}: {e})"
         if veto:
-            return f"skip: Qwen veto - {reason}" + tm_note
+            return f"skip: Qwen veto - {reason}"
 
-    result = enter_crypto(symbol, qty, ask, row, ctx) if crypto else enter_stock(symbol, qty, ask, row, ctx)
-    return result + tm_note
+    return enter_crypto(symbol, qty, ask, row, ctx) if crypto else enter_stock(symbol, qty, ask, row, ctx)
 
 
 def last_activity(symbol: str):

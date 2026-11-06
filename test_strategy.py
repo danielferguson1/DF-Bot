@@ -10,7 +10,6 @@ import pandas as pd
 import config
 import metrics
 import strategy
-import timemachine
 from backtest import simulate
 
 FIXTURE = Path(__file__).with_name("fixtures") / "AAPL-5m-iex.csv.gz"  # real IEX bars, 2026-07-29..11-05
@@ -195,52 +194,6 @@ class BacktestRules(unittest.TestCase):
             self.assertEqual(simulate(frame(4, "2026-11-02 10:00", low=[100, 100, 90, 95]), cost=0.0), [])
 
 
-def synthetic_days(n_days, drift):
-    """n_days complete sessions; each bar closes `drift` above the last and ranges +-0.1%."""
-    days = []
-    for _ in range(n_days):
-        c = 100 * (1 + drift) ** np.arange(timemachine.BARS_PER_DAY)
-        o = np.concatenate([[100], c[:-1]])
-        days.append(np.stack([o, np.maximum(o, c) * 1.001, np.minimum(o, c) * 0.999, c], axis=1))
-    return np.array(days)
-
-
-class TimeMachine(unittest.TestCase):
-    def test_steady_uptrend_hits_target(self):
-        days = synthetic_days(20, 0.001)
-        hist = timemachine.history(days, 6, 0.005, 0.01)
-        self.assertEqual((hist["n"], hist["target"]), (20, 1.0))
-        mc = timemachine.replay(days, 6, 0.005, 0.01, replays=500)
-        self.assertEqual(mc["target"], 1.0)
-        self.assertAlmostEqual(mc["avg_r"], 2.0, places=1)
-
-    def test_downtrend_hits_stop(self):
-        mc = timemachine.replay(synthetic_days(20, -0.001), 6, 0.005, 0.01, replays=500)
-        self.assertEqual(mc["stop"], 1.0)
-        self.assertLess(mc["avg_r"], -0.99)
-
-    def test_too_little_history_or_too_late(self):
-        df = real_bars()
-        self.assertIsNone(timemachine.run(df.iloc[:78 * 5], ts("2026-11-06 10:00"), 100, 99, 102))
-        self.assertIsNone(timemachine.run(df, ts("2026-11-06 15:50"), 100, 99, 102))  # past the flatten
-        self.assertIsNone(timemachine.run(df, ts("2026-11-06 10:00"), 100, 101, 102))  # stop above entry
-
-    def test_real_aapl(self):
-        df = real_bars()
-        tm = timemachine.run(df, ts("2026-11-06 10:00:10"), 270.0, 268.5, 273.0, replays=2000)
-        mc, hist = tm["mc"], tm["history"]
-        self.assertEqual(hist["n"], config.TM_DAYS)               # the last 60 of the fixture's 71 full days
-        for r in (mc, hist):
-            self.assertAlmostEqual(r["target"] + r["stop"] + r["open"], 1.0)
-            self.assertTrue(-1.5 < r["avg_r"] < 2.5)
-        again = timemachine.run(df, ts("2026-11-06 10:00:10"), 270.0, 268.5, 273.0, replays=2000)
-        self.assertEqual(again, tm)                                # fixed seed: repeatable
-        self.assertIn("TM 60d: replays target", timemachine.describe(tm))
-
-    def test_only_sessions_before_today_are_used(self):
-        df = real_bars()
-        days = timemachine.full_sessions(df, ts("2026-11-05 12:00").date())
-        self.assertEqual(len(days), 70)                            # 11-05 itself is left out
 
 
 if __name__ == "__main__":

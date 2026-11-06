@@ -8,7 +8,7 @@ reward:risk, ATR stop/target, end-of-day flatten for stocks.
 Simplifications (results will look better than live):
 - each symbol is simulated independently: no MAX_POSITIONS / exposure / sector / daily-loss / daily-risk /
   entries-per-day caps
-- no spread check, earnings check, time-machine filter or Qwen news veto
+- no spread check, earnings check or Qwen news veto
 - only config.WATCHLIST: the scanner's daily picks can't be replayed (past most-active lists aren't kept)
 - if a bar touches both stop and target, the stop is assumed to hit first (conservative)
 """

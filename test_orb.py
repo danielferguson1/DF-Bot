@@ -176,13 +176,22 @@ class ProtectiveStop(BotTestCase):
     def test_partial_fill_grows_stop(self):
         bot.db.entry_risk.return_value = (5, 1.1)
         self.client.get_open_position.return_value = position(-20, 49.08, 49.00)
-        self.client.get_orders.return_value = [NS(id="s1", symbol="DOWN", side=OrderSide.BUY, stop_price="49.30",
-                                                  qty="5", type=OrderType.STOP)]
+        old = NS(id="s1", symbol="DOWN", side=OrderSide.BUY, stop_price="49.30", qty="5", type=OrderType.STOP)
+        self.client.get_orders.side_effect = [[old], [old], []]   # still open on the first check after cancel
         bot.ensure_orb_stop("DOWN")
         self.client.cancel_order_by_id.assert_called_once_with("s1")
         self.assertEqual(self.client.submit_order.call_args.args[0].qty, 20)
         risk = next(c.kwargs for c in bot.db.log.call_args_list if c.args == ("risk",))
         self.assertEqual(risk["qty"], 15)
+
+    def test_no_replacement_while_old_stop_lingers(self):
+        bot.db.entry_risk.return_value = (5, 1.1)
+        self.client.get_open_position.return_value = position(-20, 49.08, 49.00)
+        self.client.get_orders.return_value = [NS(id="s1", symbol="DOWN", side=OrderSide.BUY, stop_price="49.30",
+                                                  qty="5", type=OrderType.STOP)]
+        with self.assertRaisesRegex(RuntimeError, "old stop still open"):
+            bot.ensure_orb_stop("DOWN")   # the next scan retries; ensure_orb_stop_safe alerts
+        self.client.submit_order.assert_not_called()
 
     def test_already_past_stop_closes(self):
         self.client.get_open_position.return_value = position(-20, 49.08, 49.35)
@@ -236,6 +245,22 @@ class Housekeeping(BotTestCase):
         bot.state.update(orb_placed=TODAY)
         bot.orb_cycle(make_ctx(loss_hit=True))
         self.client.cancel_order_by_id.assert_called_once_with("e")
+
+
+class RoundTrips(unittest.TestCase):
+    def test_short_then_long_in_the_same_symbol(self):
+        import metrics
+        fills = [("DOWN", "sell", 20, 49.08, "e2"), ("DOWN", "buy", 20, 49.32, "s2"),   # short: -$4.80
+                 ("DOWN", "buy", 10, 50.0, "e3"), ("DOWN", "sell", 10, 51.0, "x3")]     # long: +$10
+        self.assertEqual([round(p, 2) for p in metrics.round_trips(fills)], [-4.8, 10.0])
+
+    def test_partial_cover_and_crypto_presale_ignored(self):
+        import metrics
+        fills = [("DOWN", "sell", 10, 50.0, "e"), ("DOWN", "buy", 4, 49.0, "c1"), ("DOWN", "buy", 6, 51.0, "c2"),
+                 ("BTCUSD", "sell", 0.01, 70_000, "old"), ("BTCUSD", "buy", 0.01, 69_000, "b"),
+                 ("BTCUSD", "sell", 0.01, 71_000, "x")]
+        # DOWN: +4 then -6; BTC: the first sell predates logging, so the buy opens a long that closes +$20
+        self.assertEqual([round(p, 2) for p in metrics.round_trips(fills)], [4.0, -6.0, 20.0])
 
 
 class Report(unittest.TestCase):

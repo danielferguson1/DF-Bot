@@ -282,11 +282,9 @@ ROW = NS(atr_14=1.0)  # plan from the $100 ask: stop 98.50, target 103.00, 20 sh
 class EntryGates(BotTestCase):
     def setUp(self):
         super().setUp()
-        for target, new in (("latest_quote", mock.Mock(return_value=QUOTE)),
-                            ("time_machine", mock.Mock(return_value=None))):
-            patcher = mock.patch.object(bot, target, new)
-            patcher.start()
-            self.addCleanup(patcher.stop)
+        patcher = mock.patch.object(bot, "latest_quote", mock.Mock(return_value=QUOTE))
+        patcher.start()
+        self.addCleanup(patcher.stop)
         for patcher in (mock.patch.dict(os.environ, {"ALPHAVANTAGE_API_KEY": "k"}),
                         mock.patch.object(bot.config, "USE_LLM_VETO", False)):
             patcher.start()
@@ -348,16 +346,6 @@ class EntryGates(BotTestCase):
         # budget 1% of $100k = $1000; $975 already committed + $30 is over
         self.assertIn("daily risk budget", self.enter(risk_today=975.0))
         self.assertTrue(self.enter(risk_today=970.0).startswith("entered"))
-
-    def test_time_machine_logs_and_filters(self):
-        tm = {"mc": {"n": 10000, "target": .2, "stop": .6, "open": .2, "avg_r": -0.3},
-              "history": {"n": 60, "target": .2, "stop": .5, "open": .3, "avg_r": -0.1}}
-        bot.time_machine.return_value = tm
-        self.assertIn("| TM 60d: replays target 20%", self.enter())  # log only by default
-        with mock.patch.object(bot.config, "TM_MIN_EXPECTED_R", 0.0):
-            self.assertIn("skip: time machine avg -0.30R", self.enter())
-        bot.time_machine.assert_called_with("AAPL", 100.0, 98.5, 103.0, MARKET)
-
 
 class RiskRefund(BotTestCase):
     def test_cancelled_entry_gives_back_the_unfilled_part(self):

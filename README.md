@@ -13,7 +13,6 @@ Intraday paper-trading bot for Alpaca. Code-defined rules decide trades.
 | `orb.py` | Stocks in play: universe, ranking, entry/stop prices, sizing (pure functions) |
 | `orb_report.py` | How ORB fills on paper: entry and stop slippage, realized R per trade |
 | `strategy.py` | SMA/RSI indicators, BUY/SELL rules, entry window, cooldown, reward:risk, sizing |
-| `timemachine.py` | Before each stock BUY: the plan replayed 10,000 times + on every past session (60 days) |
 | `bot.py` | Live loop: scans at each 5-min bar close, places bracket orders, logs, alerts |
 | `backtest.py` | Replays the same rules on history and compares with buy-and-hold SPY |
 | `report.py` | Paper-account performance (win rate, Sharpe, max drawdown) |
@@ -43,9 +42,8 @@ TELEGRAM_CHAT_ID=...
 1. `python -m unittest -v`
 2. `python backtest.py --days 60 --cost-bps 5`. If the strategy doesn't beat buy-and-hold
    after costs, change the rules in `strategy.py` before trading it.
-3. `python timemachine.py AAPL` to see the odds the bot would log for a BUY right now.
-4. `python bot.py` on paper for a few weeks. Press `q` to stop. Start it before 9:00 ET on trading days.
-5. `python orb_report.py` (ORB fills) and `python report.py --period 1M` (account) to check results.
+3. `python bot.py` on paper for a few weeks. Press `q` to stop. Start it before 9:00 ET on trading days.
+4. `python orb_report.py` (ORB fills) and `python report.py --period 1M` (account) to check results.
 
 ## Stocks in play (ORB)
 
@@ -61,7 +59,7 @@ From Zarattini, Barbon & Aziz (2023), "A Profitable Day Trading Strategy for the
    Every scan re-checks that each ORB position has its stop (right side and size).
 4. **15:50**: everything still open is closed; unfilled entries are cancelled. No target.
 
-Not applied to ORB: the earnings check, Qwen, the time machine and the cooldown (stocks in play are usually
+Not applied to ORB: the earnings check, Qwen and the cooldown (stocks in play are usually
 news or earnings days, which is the point). Applied: the daily loss limit (it also cancels pending ORB entries)
 and the daily risk budget.
 
@@ -87,7 +85,6 @@ In order; the first one that fails is logged as the reason (`trades.db`, table `
 | size | under 1 share / crypto minimum, or over `MAX_EXPOSURE_USD` |
 | reward:risk | (target - ask) / (ask - stop) under `MIN_REWARD_RISK` (1.5) |
 | daily risk | today's entries at their full loss-at-stop, win or lose, plus this one, over `DAILY_RISK_PCT` (1%) |
-| time machine | stocks, only if `TM_MIN_EXPECTED_R` is set: simulated average R below it (default: log only) |
 | Qwen | the headline check vetoes it, or can't run |
 
 The daily risk budget counts risk when an entry is sent, so 3 losing trades can't be followed by a 4th
@@ -100,15 +97,6 @@ plain tickers, $10-$1000, not OTC, not leveraged/inverse/short funds, ranked by 
 gate above. Each scanned stock is its own "sector", so the sector cap won't stop e.g. MU + AMD + INTC
 together. The backtest can't replay this (past most-active lists aren't kept): paper-test it, or set
 `USE_SCANNER = False`.
-
-## Time machine
-
-`timemachine.py` takes the bot's plan (entry, stop, target as % of price) and the symbol's last 60 full
-sessions of 5-minute bars. Replays: 10,000 rest-of-days, each bar drawn from real bars at about the same
-time of day, ending at the target, the stop or the 15:50 flatten. History: the same plan entered at the same
-time on each real past session. Both go into the decision log, e.g.
-`TM 60d: replays target 24% / stop 63% / open 13%, avg -0.09R; history 15% / 63% / 22%, avg -0.22R`.
-It is the last 3 months, not a prediction. Set `TM_MIN_EXPECTED_R = 0.0` to use it as a filter.
 
 ## Run it unattended (Windows Task Scheduler)
 
