@@ -5,20 +5,26 @@ Stocks: every entry is a bracket order, so Alpaca holds the stop and target.
 Crypto: Alpaca has no brackets for crypto, so each fill gets a stop-limit order (re-checked every
 scan) and the take-profit is checked in code at each bar close.
 """
+import csv
+import io
 import json
 import os
+import re
 import threading
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 
 import msvcrt
+import pandas as pd
 import requests
 from dotenv import load_dotenv
 
 from alpaca.data.historical import CryptoHistoricalDataClient, StockHistoricalDataClient
+from alpaca.data.enums import MostActivesBy
 from alpaca.data.historical.news import NewsClient
-from alpaca.data.requests import (CryptoBarsRequest, CryptoLatestQuoteRequest, NewsRequest,
-                                  StockBarsRequest, StockLatestQuoteRequest)
+from alpaca.data.historical.screener import ScreenerClient
+from alpaca.data.requests import (CryptoBarsRequest, CryptoLatestQuoteRequest, MostActivesRequest, NewsRequest,
+                                  StockBarsRequest, StockLatestQuoteRequest, StockSnapshotRequest)
 from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 from alpaca.common.exceptions import APIError
 from alpaca.trading.client import TradingClient
@@ -32,6 +38,7 @@ import config
 import db
 import metrics
 import strategy
+import timemachine
 
 load_dotenv()
 API_KEY, SECRET_KEY = os.getenv("ALPACA_API_KEY"), os.getenv("ALPACA_SECRET_KEY")
@@ -42,6 +49,8 @@ trading_client = TradingClient(API_KEY, SECRET_KEY, paper=True)
 data_client = StockHistoricalDataClient(API_KEY, SECRET_KEY)
 crypto_client = CryptoHistoricalDataClient(API_KEY, SECRET_KEY)
 news_client = NewsClient(API_KEY, SECRET_KEY)
+screener_client = ScreenerClient(API_KEY, SECRET_KEY)
+NY = "America/New_York"
 
 
 # ---------- symbols ----------
@@ -58,8 +67,19 @@ def is_crypto(symbol: str) -> bool:
     return key(symbol) in CRYPTO_KEYS
 
 
-def sector(symbol: str):
-    return {key(s): v for s, v in config.SECTORS.items()}.get(key(symbol))
+def sector(symbol: str) -> str:
+    """Symbols added by the scanner have no listed sector: each gets its own, so the sector cap doesn't
+    lump unrelated stocks together."""
+    return {key(s): v for s, v in config.SECTORS.items()}.get(key(symbol), f"other:{key(symbol)}")
+
+
+def et(ts) -> pd.Timestamp:
+    return pd.Timestamp(ts).tz_convert(NY)
+
+
+def et_day_start(now) -> str:
+    """New York midnight of `now`, as the UTC ISO string trades.db timestamps compare against."""
+    return et(now).normalize().tz_convert("UTC").isoformat()
 
 
 # ---------- alerts ----------
@@ -101,7 +121,7 @@ def _prepare(raw, symbols, now, regular_hours_only: bool) -> dict:
         if regular_hours_only:
             df = strategy.regular_hours(df)
         df = df[df.index + timedelta(minutes=config.BAR_MINUTES) <= now]  # drop the bar still forming
-        out[s] = strategy.add_indicators(df)
+        out[s] = strategy.add_indicators(df, sessions=regular_hours_only)
     return out
 
 
@@ -193,6 +213,127 @@ def check_ollama():
     news_check_status(None)
 
 
+def service_status(name: str, error: Exception | None, down_msg: str):
+    """Alert once when a fail-closed check (earnings calendar, ...) starts failing, and once when it recovers."""
+    flag = f"{name}_down"
+    if error is not None and not state.get(flag):
+        state[flag] = True
+        notify(f"[!] {name} failing ({type(error).__name__}: {error}). {down_msg}")
+    elif error is None and state.get(flag):
+        state[flag] = False
+        notify(f"[OK] {name} is working again.")
+
+
+# ---------- earnings calendar (code, not the LLM) ----------
+
+EARNINGS_URL = "https://www.alphavantage.co/query"
+_earnings = {}  # New York date fetched -> {report date: set of symbols}
+
+
+def parse_earnings(text: str) -> dict:
+    """Alpha Vantage EARNINGS_CALENDAR CSV -> {date: {symbols}}. Errors and rate limits come back as JSON
+    instead of CSV, and must not read as 'nobody reports'."""
+    text = text.strip()
+    if not text.startswith("symbol,"):
+        raise ValueError(f"unexpected calendar response: {text[:200]}")
+    out = {}
+    for row in csv.DictReader(io.StringIO(text)):
+        if row.get("symbol") and row.get("reportDate"):
+            out.setdefault(date.fromisoformat(row["reportDate"]), set()).add(row["symbol"].strip().upper())
+    return out
+
+
+def earnings_calendar(today) -> dict:
+    """The next 3 months of reports, fetched once per New York day (the free tier allows 25 calls a day)."""
+    if today not in _earnings:
+        resp = requests.get(EARNINGS_URL, timeout=20, params={
+            "function": "EARNINGS_CALENDAR", "horizon": "3month", "apikey": os.getenv("ALPHAVANTAGE_API_KEY")})
+        resp.raise_for_status()
+        _earnings.clear()
+        _earnings[today] = parse_earnings(resp.text)
+    return _earnings[today]
+
+
+def earnings_check_on() -> bool:
+    return config.USE_EARNINGS_CHECK and bool(os.getenv("ALPHAVANTAGE_API_KEY"))
+
+
+def earnings_block(symbol: str, ctx) -> str | None:
+    """'reports today' / 'reports <date>' if the stock has earnings in the blocked window, else None.
+    Raises if the calendar can't be read (the caller fails closed)."""
+    today = et(ctx["now"]).date()
+    cal = earnings_calendar(today)
+    days = [today] + ([ctx["next_session"]] if config.EARNINGS_BLOCK_NEXT_DAY else [])
+    for i, d in enumerate(days):
+        if key(symbol) in cal.get(d, set()):
+            return "reports today" if i == 0 else f"reports {d:%a %m-%d}"
+    return None
+
+
+# ---------- time machine ----------
+
+_tm_bars = {}  # (symbol, New York date) -> regular-hours 5-minute bars of the last TM_DAYS sessions
+
+
+def time_machine(symbol: str, entry: float, stop: float, target: float, now) -> dict | None:
+    k = (symbol, et(now).date())
+    if k not in _tm_bars:
+        raw = data_client.get_stock_bars(StockBarsRequest(
+            symbol_or_symbols=symbol, timeframe=TimeFrame(config.BAR_MINUTES, TimeFrameUnit.Minute),
+            start=now - timedelta(days=int(config.TM_DAYS * 1.5) + 7), end=et(now).normalize(),
+            feed=config.DATA_FEED)).df  # end at today's midnight: only past sessions are needed
+        _tm_bars[k] = strategy.regular_hours(raw.loc[symbol]) if symbol in raw.index.get_level_values(0) \
+            else raw.iloc[0:0]
+    return timemachine.run(_tm_bars[k], now, entry, stop, target, replays=config.TM_REPLAYS)
+
+
+# ---------- morning scanner ----------
+
+def scan_watchlist() -> list[str]:
+    """Alpaca's most-active stocks, filtered to plain, liquid, affordable US shares, ranked by dollar volume."""
+    actives = screener_client.get_most_actives(
+        MostActivesRequest(top=config.SCAN_CANDIDATES, by=MostActivesBy.VOLUME)).most_actives
+    known = {key(s) for s in config.WATCHLIST}
+    candidates = [a for a in actives if re.fullmatch(r"[A-Z]{1,5}", a.symbol) and a.symbol not in known]
+    if not candidates:
+        return []
+    snaps = data_client.get_stock_snapshot(StockSnapshotRequest(
+        symbol_or_symbols=[a.symbol for a in candidates], feed=config.DATA_FEED))
+    exclude = re.compile(config.SCAN_EXCLUDE_NAME, re.IGNORECASE)
+    ranked = []
+    for a in candidates:
+        snap = snaps.get(a.symbol)
+        price = float(snap.latest_trade.price) if snap and snap.latest_trade else 0.0
+        if not config.SCAN_MIN_PRICE <= price <= config.SCAN_MAX_PRICE:
+            continue
+        asset = trading_client.get_asset(a.symbol)
+        exchange = str(getattr(asset.exchange, "value", asset.exchange))
+        if (not asset.tradable or asset.asset_class != AssetClass.US_EQUITY or exchange == "OTC"
+                or exclude.search(asset.name or "")):
+            continue
+        ranked.append((a.volume * price, a.symbol))
+    return [s for _, s in sorted(ranked, reverse=True)[:config.SCAN_TOP]]
+
+
+def maybe_scan(now):
+    """Once a New York day, at the start of the entry window (scanned stocks can't trade before it anyway).
+    Until today's scan works, no scanned symbols are watched (yesterday's list is dropped)."""
+    today = et(now).date()
+    if not config.USE_SCANNER or state["scan_day"] == today:
+        return
+    state["scanned"] = []
+    if not strategy.in_entry_window(et(now)):
+        return
+    try:
+        scanned = scan_watchlist()
+    except Exception as e:
+        report_symbol_error("scanner", e)  # alerts once per distinct error; retried next scan
+        return
+    state["symbol_errors"].pop("scanner", None)
+    state["scanned"], state["scan_day"] = scanned, today
+    notify(f"[SCAN] Added today: {', '.join(scanned) or 'none passed the filters'}")
+
+
 # ---------- orders ----------
 
 def open_orders(symbol: str | None = None):
@@ -262,6 +403,10 @@ def restore_stop(symbol: str, stop_price: float | None, close_error: Exception):
                f"Check Alpaca now.")
 
 
+def crypto_stop_price(entry: float, atr: float) -> float:
+    return strategy.round_to_increment(entry - config.STOP_ATR * atr, 0.01)
+
+
 def ensure_crypto_stop(symbol: str, pos, row) -> str:
     """Crypto has no brackets: make sure a held position always has a working sell stop on Alpaca."""
     sells = [o for o in open_orders(symbol) if o.side == OrderSide.SELL]
@@ -275,7 +420,7 @@ def ensure_crypto_stop(symbol: str, pos, row) -> str:
     if strategy._nan(atr) or atr <= 0:
         notify(f"[!] {symbol} has NO STOP: ATR unavailable. Check Alpaca.")
         return "no stop: ATR unavailable"
-    stop = strategy.round_to_increment(entry - config.STOP_ATR * atr, 0.01)
+    stop = crypto_stop_price(entry, atr)
     if row.close <= stop:
         flatten(symbol)
         return "already below stop: exited"
@@ -306,6 +451,19 @@ def wait_for_order(order_id, seconds: float = 10) -> float:
     return float(order.filled_qty or 0)
 
 
+def refund_unfilled_risk(order):
+    """A cancelled entry only risks what filled: give the rest back to today's risk budget.
+    (filled_qty is read before the cancel; a fill in the last instant is still counted as unfilled.)"""
+    logged = db.entry_risk(str(order.id))
+    if not logged:
+        return
+    qty, risk = logged
+    unfilled = max(0.0, qty - float(getattr(order, "filled_qty", None) or 0))
+    if qty > 0 and unfilled > 0:
+        db.log("risk", symbol=key(order.symbol), order_id=str(order.id), qty=-unfilled,
+               risk_usd=-risk * unfilled / qty, note="refund: entry cancelled")
+
+
 def cancel_stale_entries(orders, now: datetime) -> list:
     """Cancel entry orders unfilled after ENTRY_TIMEOUT_MIN. Returns the entries still pending."""
     pending = []
@@ -316,6 +474,7 @@ def cancel_stale_entries(orders, now: datetime) -> list:
         if submitted and now - submitted > timedelta(minutes=config.ENTRY_TIMEOUT_MIN):
             trading_client.cancel_order_by_id(o.id)
             db.log("orders", symbol=key(o.symbol), side="buy", order_id=str(o.id), note="cancel stale entry")
+            refund_unfilled_risk(o)
             print(f"   Cancelled stale entry for {o.symbol}")
         else:
             pending.append(o)
@@ -336,6 +495,8 @@ def try_enter(symbol, row, ctx) -> str:
         return "skip: daily loss limit"
     if not crypto and ctx["minutes_to_close"] <= config.NO_ENTRY_MINUTES_BEFORE_CLOSE:
         return "skip: too close to market close"
+    if not crypto and not strategy.in_entry_window(et(ctx["now"])):
+        return f"skip: first {config.NO_ENTRY_MINUTES_AFTER_OPEN} min after the open"
     if key(symbol) in ctx["pending_symbols"]:
         return "skip: entry already pending"
     holdings = set(ctx["positions"]) | ctx["pending_symbols"]
@@ -347,6 +508,19 @@ def try_enter(symbol, row, ctx) -> str:
     side = market_side(symbol)
     if side and any(market_side(s) == -side for s in holdings):
         return "skip: opposite index fund held (would cancel out)"
+    if ctx["entries_today"] >= config.MAX_ENTRIES_PER_DAY:
+        return f"skip: {config.MAX_ENTRIES_PER_DAY} entries already today"
+    if not strategy.cooled_down(last_activity(symbol), ctx["now"]):
+        return f"skip: cooldown ({config.SYMBOL_COOLDOWN_MIN} min since last entry/exit)"
+    if not crypto and earnings_check_on():
+        try:
+            reason = earnings_block(symbol, ctx)
+        except Exception as e:  # fail closed, like the Qwen check
+            service_status("Earnings calendar", e, "Every stock BUY is skipped until it works again.")
+            return f"skip: earnings check failed ({type(e).__name__})"
+        service_status("Earnings calendar", None, "")
+        if reason:
+            return f"skip: earnings ({reason})"
 
     quote = latest_quote(symbol)
     bid, ask = float(quote.bid_price), float(quote.ask_price)
@@ -367,6 +541,32 @@ def try_enter(symbol, row, ctx) -> str:
     if ctx["exposure"] + qty * ask > config.MAX_EXPOSURE_USD:
         return "skip: exposure cap"
 
+    # the plan, measured from the live ask (not the bar close), exactly as enter_stock/enter_crypto will set it
+    stop, target = strategy.bracket_prices(ask, row.atr_14)
+    if crypto:
+        stop = crypto_stop_price(ask, row.atr_14)
+    rr = strategy.reward_risk(ask, stop, target)
+    if rr < config.MIN_REWARD_RISK:
+        return f"skip: reward:risk {rr:.2f} < {config.MIN_REWARD_RISK}"
+    risk = qty * (ask - stop)
+    budget = ctx["last_equity"] * config.DAILY_RISK_PCT
+    if ctx["risk_today"] + risk > budget:
+        return (f"skip: daily risk budget (today ${ctx['risk_today']:,.0f} + this ${risk:,.0f} "
+                f"> ${budget:,.0f})")
+
+    tm_note = ""
+    if not crypto and config.USE_TIME_MACHINE:
+        try:
+            tm = time_machine(symbol, ask, stop, target, ctx["now"])
+            tm_note = " | " + timemachine.describe(tm)
+        except Exception as e:
+            tm, tm_note = None, f" | TM failed ({type(e).__name__}: {e})"
+            if config.TM_MIN_EXPECTED_R is not None:
+                return "skip: time machine failed" + tm_note
+        if (config.TM_MIN_EXPECTED_R is not None and tm is not None
+                and tm["mc"]["avg_r"] < config.TM_MIN_EXPECTED_R):
+            return f"skip: time machine avg {tm['mc']['avg_r']:+.2f}R < {config.TM_MIN_EXPECTED_R:+.2f}R" + tm_note
+
     if config.USE_LLM_VETO:
         try:
             veto, reason = llm_news_veto(symbol, ctx["now"])
@@ -374,19 +574,34 @@ def try_enter(symbol, row, ctx) -> str:
             news_check_status(e)
             return f"skip: news check failed ({type(e).__name__}: {e})"
         if veto:
-            return f"skip: Qwen veto - {reason}"
+            return f"skip: Qwen veto - {reason}" + tm_note
 
-    return enter_crypto(symbol, qty, ask, row, ctx) if crypto else enter_stock(symbol, qty, ask, row, ctx)
+    result = enter_crypto(symbol, qty, ask, row, ctx) if crypto else enter_stock(symbol, qty, ask, row, ctx)
+    return result + tm_note
+
+
+def last_activity(symbol: str):
+    """Latest entry or exit fill in this symbol, from trades.db (so it survives restarts)."""
+    ts = db.last_activity(key(symbol))
+    return datetime.fromisoformat(ts) if ts else None
+
+
+def commit_risk(symbol, order_id, qty, risk_usd, ctx):
+    db.log("risk", symbol=key(symbol), order_id=str(order_id), qty=qty, risk_usd=risk_usd, note="entry")
+    ctx["risk_today"] += risk_usd
+    ctx["entries_today"] += 1
 
 
 def enter_stock(symbol, qty, ask, row, ctx) -> str:
     stop, tp = strategy.bracket_prices(ask, row.atr_14)
+    limit = round(ask, 2)
     order = trading_client.submit_order(LimitOrderRequest(
         symbol=symbol, qty=qty, side=OrderSide.BUY, time_in_force=TimeInForce.GTC,
-        limit_price=round(ask, 2), order_class=OrderClass.BRACKET,
+        limit_price=limit, order_class=OrderClass.BRACKET,
         take_profit=TakeProfitRequest(limit_price=tp), stop_loss=StopLossRequest(stop_price=stop)))
-    db.log("orders", symbol=symbol, side="buy", qty=qty, limit_price=round(ask, 2),
+    db.log("orders", symbol=symbol, side="buy", qty=qty, limit_price=limit,
            stop_price=stop, take_profit=tp, order_id=str(order.id), note="entry: bracket")
+    commit_risk(symbol, order.id, qty, qty * (limit - stop), ctx)
     ctx["exposure"] += qty * ask
     ctx["pending_symbols"].add(symbol)
     notify(f"[ENTRY] BUY {qty} {symbol} limit ${ask:.2f}, stop ${stop:.2f}, target ${tp:.2f}")
@@ -405,6 +620,8 @@ def enter_crypto(symbol, qty, ask, row, ctx) -> str:
         return "skip: IOC entry not filled"
     ctx["exposure"] += filled * ask
     ctx["positions"][key(symbol)] = pos = trading_client.get_open_position(key(symbol))
+    entry = float(pos.avg_entry_price)
+    commit_risk(symbol, order.id, filled, filled * (entry - crypto_stop_price(entry, row.atr_14)), ctx)
     _, tp = strategy.bracket_prices(float(pos.avg_entry_price), row.atr_14)
     notify(f"[ENTRY] BUY {filled:g} {symbol} @ ~${float(pos.avg_entry_price):,.2f}, target ${tp:,.2f} (checked in code)")
     return "entered; " + ensure_crypto_stop(symbol, pos, row)
@@ -413,7 +630,8 @@ def enter_crypto(symbol, qty, ask, row, ctx) -> str:
 # ---------- main cycle ----------
 
 state = {"loss_alert_day": None, "flatten_day": None, "flatten_time": None,
-         "summary_day": None, "last_error": None, "news_down": False, "symbol_errors": {}}
+         "summary_day": None, "last_error": None, "news_down": False, "symbol_errors": {},
+         "scan_day": None, "scanned": []}
 
 
 def scan_symbol(symbol, df, spy_up, ctx):
@@ -468,8 +686,11 @@ def run_trading_cycle(clock, stocks: bool):
 
     positions = {key(p.symbol): p for p in trading_client.get_all_positions()}
     pending = cancel_stale_entries(open_orders(), now)
+    risk_today, entries_today = db.risk_today(et_day_start(now))
     ctx = {
-        "now": now, "equity": equity, "loss_hit": loss_hit, "minutes_to_close": minutes_to_close,
+        "now": now, "equity": equity, "last_equity": last_equity, "loss_hit": loss_hit,
+        "minutes_to_close": minutes_to_close, "next_session": et(clock.next_open).date(),
+        "risk_today": risk_today, "entries_today": entries_today,
         "positions": positions,
         "pending_symbols": {key(o.symbol) for o in pending},
         "exposure": sum(abs(float(p.market_value)) for p in positions.values())
@@ -478,13 +699,17 @@ def run_trading_cycle(clock, stocks: bool):
 
     jobs = []  # (symbol, bars, spy_up)
     if stocks:
-        bars = fetch_stock_bars(sorted(set(config.WATCHLIST) | {config.REGIME_SYMBOL}), now)
+        maybe_scan(now)
+        # held stocks are always scanned, so a scanned stock still gets its SELL check after a restart
+        held = [p.symbol for p in positions.values() if p.asset_class != AssetClass.CRYPTO]
+        watch = list(dict.fromkeys(config.WATCHLIST + state["scanned"] + held))
+        bars = fetch_stock_bars(sorted(set(watch) | {config.REGIME_SYMBOL}), now)
         spy = bars.get(config.REGIME_SYMBOL)
         if spy is None or spy.empty or not strategy.bar_is_fresh(spy.index[-1], now):
             print("   No fresh SPY bar yet (e.g. first minutes after the open), skipping stocks this scan.")
         else:
             spy_up = strategy.regime_up(spy.iloc[-1])
-            jobs += [(s, bars.get(s), spy_up) for s in config.WATCHLIST]
+            jobs += [(s, bars.get(s), spy_up) for s in watch]
     if config.CRYPTO_WATCHLIST:
         cbars = fetch_crypto_bars(config.CRYPTO_WATCHLIST, now)
         jobs += [(s, cbars.get(s), None) for s in config.CRYPTO_WATCHLIST]
@@ -514,6 +739,7 @@ def flatten_all_once(now):
     for o in open_orders():
         if o.side == OrderSide.BUY and o.asset_class != AssetClass.CRYPTO:
             trading_client.cancel_order_by_id(o.id)  # pending stock entries
+            refund_unfilled_risk(o)  # crypto keeps trading tonight on the same daily budget
     failed = []
     for p in trading_client.get_all_positions():
         if p.asset_class == AssetClass.CRYPTO:
@@ -593,6 +819,9 @@ def main():
            + " === Press 'q' or 's' to stop.")
     if config.USE_LLM_VETO:
         check_ollama()
+    if config.USE_EARNINGS_CHECK and not earnings_check_on():
+        notify("[!] Earnings check is OFF: no ALPHAVANTAGE_API_KEY in .env (free key: alphavantage.co). "
+               "Only Qwen's headline check will catch earnings.")
     while True:
         try:
             if key_pressed():

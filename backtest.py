@@ -2,9 +2,14 @@
 
     python backtest.py --days 60 --cost-bps 5
 
+Same per-symbol rules as live: entry window after the open, no entries near the close, cooldown, minimum
+reward:risk, ATR stop/target, end-of-day flatten for stocks.
+
 Simplifications (results will look better than live):
-- each symbol is simulated independently: no MAX_POSITIONS / exposure / sector / daily-loss caps
-- no spread check and no Qwen news veto
+- each symbol is simulated independently: no MAX_POSITIONS / exposure / sector / daily-loss / daily-risk /
+  entries-per-day caps
+- no spread check, earnings check, time-machine filter or Qwen news veto
+- only config.WATCHLIST: the scanner's daily picks can't be replayed (past most-active lists aren't kept)
 - if a bar touches both stop and target, the stop is assumed to hit first (conservative)
 """
 import argparse
@@ -30,16 +35,17 @@ def simulate(df: pd.DataFrame, cost: float, equity: float = START_EQUITY, crypto
     crypto=True mirrors the live crypto path: fractional size, held overnight (no daily flatten),
     take-profit checked at bar close (the bot checks it in code), stop still intrabar."""
     trades = []
+    last_activity = None  # time of the last entry or exit, for the cooldown
     pos = None            # dict(qty, entry, stop, tp)
     pending = None        # ("BUY", atr) or ("SELL", None)
     rows = list(df.itertuples())
     et_times = df.index.tz_convert("America/New_York")
 
     def close_pos(price, when):
-        nonlocal pos
+        nonlocal pos, last_activity
         exit_price = price * (1 - cost)
         trades.append((when, pos["qty"] * (exit_price - pos["entry"])))
-        pos = None
+        pos, last_activity = None, when
 
     for i in range(1, len(rows)):
         prev, row, t = rows[i - 1], rows[i], et_times[i]
@@ -52,9 +58,10 @@ def simulate(df: pd.DataFrame, cost: float, equity: float = START_EQUITY, crypto
             elif action == "BUY" and not pos:
                 entry = row.open * (1 + cost)
                 qty = strategy.position_size(equity, entry, atr, qty_increment=1e-9 if crypto else 1)
-                if qty > 0:
-                    stop, tp = strategy.bracket_prices(entry, atr)
+                stop, tp = strategy.bracket_prices(entry, atr)
+                if qty > 0 and strategy.reward_risk(entry, stop, tp) >= config.MIN_REWARD_RISK:
                     pos = {"qty": qty, "entry": entry, "stop": stop, "tp": tp}
+                    last_activity = row.Index
         pending = None
 
         # 2. stop intrabar (gaps fill at the open); target intrabar for stocks, at the close for crypto
@@ -76,7 +83,11 @@ def simulate(df: pd.DataFrame, cost: float, equity: float = START_EQUITY, crypto
         # 4. decide for the next bar
         action = strategy.signal(prev, row, pos is not None, row.regime_ok)
         minutes_to_close = 960 - (t.hour * 60 + t.minute + config.BAR_MINUTES)
-        if not crypto and action == "BUY" and minutes_to_close <= config.NO_ENTRY_MINUTES_BEFORE_CLOSE:
+        sent_at = row.Index + pd.Timedelta(minutes=config.BAR_MINUTES)  # the order goes out at the bar close
+        if action == "BUY" and (
+                (not crypto and minutes_to_close <= config.NO_ENTRY_MINUTES_BEFORE_CLOSE)
+                or (not crypto and not strategy.in_entry_window(sent_at.tz_convert("America/New_York")))
+                or not strategy.cooled_down(last_activity, sent_at)):
             action = "HOLD"
         if action in ("BUY", "SELL"):
             pending = (action, row.atr_14)
@@ -108,7 +119,8 @@ def load_crypto_bars(client, symbols, days):
     raw = client.get_crypto_bars(CryptoBarsRequest(
         symbol_or_symbols=symbols, timeframe=TimeFrame(config.BAR_MINUTES, TimeFrameUnit.Minute),
         start=datetime.now(timezone.utc) - timedelta(days=days))).df
-    return {s: strategy.add_indicators(raw.loc[s]) for s in symbols if s in raw.index.get_level_values(0)}
+    return {s: strategy.add_indicators(raw.loc[s], sessions=False)
+            for s in symbols if s in raw.index.get_level_values(0)}
 
 
 def main():

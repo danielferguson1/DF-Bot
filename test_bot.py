@@ -21,11 +21,24 @@ class BotTestCase(unittest.TestCase):
         self.client = mock.Mock()
         self.notes = []
         for target, new in (("trading_client", self.client), ("db", mock.Mock()),
-                            ("notify", self.notes.append), ("time", mock.Mock())):
+                            ("notify", self.notes.append), ("time", mock.Mock()),
+                            ("earnings_calendar", mock.Mock(return_value={}))):
             patcher = mock.patch.object(bot, target, new)
             patcher.start()
             self.addCleanup(patcher.stop)
-        bot.state.update(flatten_day=None, flatten_time=None, summary_day=None, news_down=False)
+        bot.state.update(flatten_day=None, flatten_time=None, summary_day=None, news_down=False,
+                         scan_day=None, scanned=[], symbol_errors={})
+        bot.db.last_activity.return_value = None
+        bot.db.entry_risk.return_value = None
+        bot.db.risk_today.return_value = (0.0, 0)
+
+
+def make_ctx(now, positions=None, pending=(), minutes_to_close=300, **kw):
+    ctx = {"now": now, "equity": 100_000.0, "last_equity": 100_000.0, "loss_hit": False,
+           "minutes_to_close": minutes_to_close, "next_session": None, "risk_today": 0.0, "entries_today": 0,
+           "positions": positions or {}, "pending_symbols": set(pending), "exposure": 0.0}
+    ctx.update(kw)
+    return ctx
 
 
 ET = timezone(timedelta(hours=-5))
@@ -161,8 +174,7 @@ def btc_bars(close=70_000.0, atr=100.0):
 
 class Crypto(BotTestCase):
     def ctx(self, positions):
-        return {"now": NOW, "equity": 100_000.0, "loss_hit": False, "minutes_to_close": 0,
-                "positions": positions, "pending_symbols": set(), "exposure": 0.0}
+        return make_ctx(NOW, positions, minutes_to_close=0)
 
     def test_symbol_formats_match(self):
         self.assertTrue(bot.is_crypto("BTC/USD") and bot.is_crypto("BTCUSD"))
@@ -236,8 +248,7 @@ class Crypto(BotTestCase):
 
 class OppositeIndexFunds(BotTestCase):
     def ctx(self, held=(), pending=()):
-        return {"now": NOW, "equity": 100_000.0, "loss_hit": False, "minutes_to_close": 300,
-                "positions": {s: NS(symbol=s) for s in held}, "pending_symbols": set(pending), "exposure": 0.0}
+        return make_ctx(NOW, {s: NS(symbol=s) for s in held}, pending)
 
     def test_long_and_inverse_never_held_together(self):
         row = NS(atr_14=1.0)
@@ -262,6 +273,153 @@ class StaleEntries(BotTestCase):
         self.assertEqual(bot.cancel_stale_entries([old, unknown], now), [unknown])
         self.client.cancel_order_by_id.assert_called_once_with("a")
 
+
+MARKET = datetime(2026, 11, 6, 15, 0, 10, tzinfo=timezone.utc)  # Friday 10:00 ET
+QUOTE = NS(bid_price="99.95", ask_price="100.00")
+ROW = NS(atr_14=1.0)  # plan from the $100 ask: stop 98.50, target 103.00, 20 shares ($2000 cap), $30 at risk
+
+
+class EntryGates(BotTestCase):
+    def setUp(self):
+        super().setUp()
+        for target, new in (("latest_quote", mock.Mock(return_value=QUOTE)),
+                            ("time_machine", mock.Mock(return_value=None))):
+            patcher = mock.patch.object(bot, target, new)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        for patcher in (mock.patch.dict(os.environ, {"ALPHAVANTAGE_API_KEY": "k"}),
+                        mock.patch.object(bot.config, "USE_LLM_VETO", False)):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.client.submit_order.return_value = NS(id="o1")
+
+    def enter(self, now=MARKET, **ctx):
+        return bot.try_enter("AAPL", ROW, make_ctx(now, **ctx))
+
+    def test_enters_and_commits_risk(self):
+        ctx = make_ctx(MARKET)
+        self.assertTrue(bot.try_enter("AAPL", ROW, ctx).startswith("entered"))
+        risk_row = next(c.kwargs for c in bot.db.log.call_args_list if c.args == ("risk",))
+        self.assertEqual((risk_row["qty"], risk_row["risk_usd"]), (20, 30.0))
+        self.assertEqual((ctx["risk_today"], ctx["entries_today"]), (30.0, 1))
+
+    def test_first_minutes_after_open(self):
+        self.assertEqual(self.enter(MARKET - timedelta(minutes=20)), "skip: first 15 min after the open")
+
+    def test_entries_per_day(self):
+        self.assertIn("entries already today", self.enter(entries_today=bot.config.MAX_ENTRIES_PER_DAY))
+
+    def test_cooldown_from_db(self):
+        bot.db.last_activity.return_value = (MARKET - timedelta(minutes=10)).isoformat()
+        self.assertIn("cooldown", self.enter())
+        bot.db.last_activity.return_value = (MARKET - timedelta(minutes=31)).isoformat()
+        self.assertTrue(self.enter().startswith("entered"))
+
+    def test_earnings_today_blocks(self):
+        bot.earnings_calendar.return_value = {date(2026, 11, 6): {"AAPL"}}
+        self.assertEqual(self.enter(), "skip: earnings (reports today)")
+
+    def test_earnings_next_day_only_when_enabled(self):
+        bot.earnings_calendar.return_value = {date(2026, 11, 9): {"AAPL"}}
+        self.assertTrue(self.enter(next_session=date(2026, 11, 9)).startswith("entered"))
+        with mock.patch.object(bot.config, "EARNINGS_BLOCK_NEXT_DAY", True):
+            self.assertEqual(self.enter(next_session=date(2026, 11, 9)), "skip: earnings (reports Mon 11-09)")
+
+    def test_earnings_failure_fails_closed_and_alerts_once(self):
+        bot.earnings_calendar.side_effect = ValueError("rate limited")
+        self.assertIn("earnings check failed", self.enter())
+        self.assertIn("earnings check failed", self.enter())
+        self.assertEqual(sum("Earnings calendar failing" in n for n in self.notes), 1)
+        self.client.submit_order.assert_not_called()
+        bot.earnings_calendar.side_effect = None
+        self.assertTrue(self.enter().startswith("entered"))
+        self.assertTrue(any("Earnings calendar is working again" in n for n in self.notes))
+
+    def test_no_key_means_no_earnings_check(self):
+        bot.earnings_calendar.return_value = {date(2026, 11, 6): {"AAPL"}}
+        with mock.patch.dict(os.environ, {"ALPHAVANTAGE_API_KEY": ""}):
+            self.assertTrue(self.enter().startswith("entered"))
+
+    def test_min_reward_risk(self):
+        with mock.patch.object(bot.config, "MIN_REWARD_RISK", 2.5):
+            self.assertEqual(self.enter(), "skip: reward:risk 2.00 < 2.5")
+
+    def test_daily_risk_budget(self):
+        # budget 1% of $100k = $1000; $975 already committed + $30 is over
+        self.assertIn("daily risk budget", self.enter(risk_today=975.0))
+        self.assertTrue(self.enter(risk_today=970.0).startswith("entered"))
+
+    def test_time_machine_logs_and_filters(self):
+        tm = {"mc": {"n": 10000, "target": .2, "stop": .6, "open": .2, "avg_r": -0.3},
+              "history": {"n": 60, "target": .2, "stop": .5, "open": .3, "avg_r": -0.1}}
+        bot.time_machine.return_value = tm
+        self.assertIn("| TM 60d: replays target 20%", self.enter())  # log only by default
+        with mock.patch.object(bot.config, "TM_MIN_EXPECTED_R", 0.0):
+            self.assertIn("skip: time machine avg -0.30R", self.enter())
+        bot.time_machine.assert_called_with("AAPL", 100.0, 98.5, 103.0, MARKET)
+
+
+class RiskRefund(BotTestCase):
+    def test_cancelled_entry_gives_back_the_unfilled_part(self):
+        bot.db.entry_risk.return_value = (20, 30.0)
+        old = NS(id="a", symbol="AAPL", side=OrderSide.BUY, submitted_at=MARKET - timedelta(minutes=30),
+                 created_at=None, filled_qty="5")
+        bot.cancel_stale_entries([old], MARKET)
+        refund = next(c.kwargs for c in bot.db.log.call_args_list if c.args == ("risk",))
+        self.assertEqual((refund["qty"], refund["risk_usd"]), (-15, -22.5))
+
+    def test_day_start_is_new_york_midnight(self):
+        self.assertEqual(bot.et_day_start(MARKET), "2026-11-06T05:00:00+00:00")  # EST since Nov 1, 2026
+
+
+class Earnings(unittest.TestCase):
+    def test_parse_csv(self):
+        text = ("symbol,name,reportDate,fiscalDateEnding,estimate,currency,timeOfTheDay\r\n"
+                "AAPL,Apple Inc,2026-11-06,2026-09-30,1.8,USD,post-market\r\n"
+                "msft,Microsoft,2026-11-09,2026-09-30,3.1,USD,pre-market\r\n")
+        self.assertEqual(bot.parse_earnings(text), {date(2026, 11, 6): {"AAPL"}, date(2026, 11, 9): {"MSFT"}})
+
+    def test_error_json_is_not_an_empty_calendar(self):
+        with self.assertRaises(ValueError):
+            bot.parse_earnings('{"Information": "rate limit reached"}')
+
+
+class Scanner(BotTestCase):
+    def test_scans_once_per_day_from_the_entry_window(self):
+        bot.state["scanned"] = ["OLD"]
+        with mock.patch.object(bot, "scan_watchlist", return_value=["MU", "AMD"]) as scan:
+            bot.maybe_scan(MARKET - timedelta(minutes=20))   # 9:40: too early, yesterday's list dropped
+            self.assertEqual(bot.state["scanned"], [])
+            bot.maybe_scan(MARKET)
+            bot.maybe_scan(MARKET + timedelta(minutes=5))
+        scan.assert_called_once()
+        self.assertEqual(bot.state["scanned"], ["MU", "AMD"])
+        self.assertIn("[SCAN] Added today: MU, AMD", self.notes)
+
+    def test_failure_retries_next_scan(self):
+        with mock.patch.object(bot, "scan_watchlist", side_effect=RuntimeError("503")):
+            bot.maybe_scan(MARKET)
+        self.assertIsNone(bot.state["scan_day"])
+        with mock.patch.object(bot, "scan_watchlist", return_value=["MU"]):
+            bot.maybe_scan(MARKET + timedelta(minutes=5))
+        self.assertEqual(bot.state["scanned"], ["MU"])
+
+    def test_filters(self):
+        actives = [NS(symbol=s, volume=v) for s, v in
+                   (("SOXL", 9e7), ("PENNY", 8e7), ("BRK.B", 5e7), ("AAPL", 4e7), ("MU", 3e7), ("AMD", 2e7))]
+        prices = {"SOXL": 40, "PENNY": 2, "AAPL": 270, "MU": 120, "AMD": 250}
+        names = {"SOXL": "Direxion Daily Semiconductor Bull 3X Shares", "MU": "Micron", "AMD": "AMD"}
+        with mock.patch.object(bot, "screener_client") as sc, mock.patch.object(bot, "data_client") as dc:
+            sc.get_most_actives.return_value = NS(most_actives=actives)
+            dc.get_stock_snapshot.return_value = {s: NS(latest_trade=NS(price=p)) for s, p in prices.items()}
+            self.client.get_asset.side_effect = lambda s: NS(
+                tradable=True, asset_class=AssetClass.US_EQUITY, exchange="NASDAQ", name=names[s])
+            # AAPL is already watched; BRK.B isn't a plain ticker; PENNY is under $10; SOXL is leveraged
+            self.assertEqual(bot.scan_watchlist(), ["AMD", "MU"])  # by dollar volume: $5.0B > $3.6B
+
+    def test_scanned_symbols_get_their_own_sector(self):
+        self.assertEqual(bot.sector("MU"), "other:MU")
+        self.assertEqual(bot.market_side("MU"), 0)
 
 class EquityCurve(unittest.TestCase):
     def test_flat_days_are_kept_and_no_exit_is_dropped(self):

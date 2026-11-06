@@ -16,8 +16,11 @@ def regular_hours(df: pd.DataFrame) -> pd.DataFrame:
     return df[(minutes >= 570) & (minutes < 960)]
 
 
-def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    """df: open/high/low/close/volume, tz-aware time index, regular hours only."""
+def add_indicators(df: pd.DataFrame, sessions: bool = True) -> pd.DataFrame:
+    """df: open/high/low/close/volume, tz-aware time index.
+    sessions=True (stocks, regular hours only): the overnight gap is not counted as one bar's true range,
+    so the first bars of a day don't get an inflated ATR (and so a too-wide stop and too-small size).
+    sessions=False (crypto, 24/7): no gaps to skip."""
     df = df.copy()
     close = df["close"]
     df["sma_5"] = close.rolling(5).mean()
@@ -28,13 +31,16 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     loss = (-delta.clip(upper=0)).rolling(14).mean()
     df["rsi_14"] = (100 - 100 / (1 + gain / loss)).fillna(50)  # 0/0 (flat) -> neutral; x/0 -> 100
 
+    day = df.index.tz_convert("America/New_York").date
     prev_close = close.shift()
+    if sessions:
+        new_day = pd.Series(day, index=df.index).ne(pd.Series(day, index=df.index).shift())
+        prev_close = prev_close.mask(new_day)  # NaN -> true range falls back to high - low
     true_range = pd.concat([df["high"] - df["low"],
                             (df["high"] - prev_close).abs(),
                             (df["low"] - prev_close).abs()], axis=1).max(axis=1)
     df["atr_14"] = true_range.rolling(14).mean()
 
-    day = df.index.tz_convert("America/New_York").date
     typical = (df["high"] + df["low"] + close) / 3
     df["vwap"] = (typical * df["volume"]).groupby(day).cumsum() / df["volume"].groupby(day).cumsum()
     df["rel_volume"] = df["volume"] / df["volume"].rolling(20).mean()
@@ -84,6 +90,23 @@ def round_to_increment(x: float, inc: float, up: bool = False) -> float:
 def bracket_prices(entry: float, atr: float) -> tuple[float, float]:
     """(stop_price, take_profit_price)"""
     return round(entry - config.STOP_ATR * atr, 2), round(entry + config.TAKE_PROFIT_ATR * atr, 2)
+
+
+def reward_risk(entry: float, stop: float, target: float) -> float:
+    """(target - entry) / (entry - stop); 0 if the stop is not below the entry."""
+    risk = entry - stop
+    return (target - entry) / risk if risk > 0 else 0.0
+
+
+def in_entry_window(et_time) -> bool:
+    """Stocks: no entries in the first NO_ENTRY_MINUTES_AFTER_OPEN minutes after 9:30 New York time.
+    et_time: a datetime/Timestamp in America/New_York (the time the order would be sent)."""
+    return et_time.hour * 60 + et_time.minute >= 570 + config.NO_ENTRY_MINUTES_AFTER_OPEN
+
+
+def cooled_down(last_activity, now) -> bool:
+    """True if there was no entry/exit in this symbol in the last SYMBOL_COOLDOWN_MIN minutes."""
+    return last_activity is None or now - last_activity >= pd.Timedelta(minutes=config.SYMBOL_COOLDOWN_MIN)
 
 
 def _nan(x) -> bool:

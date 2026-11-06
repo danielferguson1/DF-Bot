@@ -6,12 +6,13 @@ can only veto a BUY after reading the last 24h of headlines.
 | File | What it does |
 |---|---|
 | `config.py` | Every setting: watchlist, risk limits, ATR stop/target, spread limit, feed |
-| `strategy.py` | Indicators, BUY/SELL rules, position sizing (pure functions) |
+| `strategy.py` | Indicators, BUY/SELL rules, entry window, cooldown, reward:risk, sizing (pure functions) |
+| `timemachine.py` | Before each stock BUY: the plan replayed 10,000 times + on every past session (60 days) |
 | `bot.py` | Live loop: scans at each 5-min bar close, places bracket orders, logs, alerts |
 | `backtest.py` | Replays the same rules on history and compares with buy-and-hold SPY |
 | `report.py` | Paper-account performance (win rate, Sharpe, max drawdown) |
 | `db.py` | SQLite log in `trades.db`: decisions, orders, fills |
-| `test_strategy.py` | Unit tests for the logic above |
+| `test_strategy.py`, `test_bot.py` | Unit tests; offline, partly on real AAPL bars in `fixtures/` |
 
 ## Setup
 
@@ -24,6 +25,8 @@ ollama pull qwen2.5:7b
 ```
 ALPACA_API_KEY=...
 ALPACA_SECRET_KEY=...
+# earnings calendar (free key from alphavantage.co; without it the earnings check is off)
+ALPHAVANTAGE_API_KEY=...
 # optional Telegram alerts (fills, errors, risk events)
 TELEGRAM_BOT_TOKEN=...
 TELEGRAM_CHAT_ID=...
@@ -34,8 +37,48 @@ TELEGRAM_CHAT_ID=...
 1. `python -m unittest -v`
 2. `python backtest.py --days 60 --cost-bps 5`. If the strategy doesn't beat buy-and-hold
    after costs, change the rules in `strategy.py` before trading it.
-3. `python bot.py` on paper for a few weeks. Press `q` to stop.
-4. `python report.py --period 1M` to check results.
+3. `python timemachine.py AAPL` to see the odds the bot would log for a BUY right now.
+4. `python bot.py` on paper for a few weeks. Press `q` to stop.
+5. `python report.py --period 1M` to check results.
+
+## What a BUY has to pass
+
+In order; the first one that fails is logged as the reason (`trades.db`, table `decisions`).
+
+| gate | skips the BUY when |
+|---|---|
+| daily loss | equity is down `DAILY_LOSS_PCT` (2%) from yesterday's close |
+| time | stocks: in the first `NO_ENTRY_MINUTES_AFTER_OPEN` (15) min or the last `NO_ENTRY_MINUTES_BEFORE_CLOSE` (30) |
+| positions | already held/pending, `MAX_POSITIONS`, `MAX_PER_SECTOR`, or a long and an inverse index fund together |
+| entries per day | `MAX_ENTRIES_PER_DAY` (6) entries already today, all symbols |
+| cooldown | an entry or exit in that symbol in the last `SYMBOL_COOLDOWN_MIN` (30) min |
+| earnings | stocks: the company reports today (Alpha Vantage calendar; can't be read = skip) |
+| quote | bad quote or spread over `MAX_SPREAD_PCT` |
+| size | under 1 share / crypto minimum, or over `MAX_EXPOSURE_USD` |
+| reward:risk | (target - ask) / (ask - stop) under `MIN_REWARD_RISK` (1.5) |
+| daily risk | today's entries at their full loss-at-stop, win or lose, plus this one, over `DAILY_RISK_PCT` (1%) |
+| time machine | stocks, only if `TM_MIN_EXPECTED_R` is set: simulated average R below it (default: log only) |
+| Qwen | the headline check vetoes it, or can't run |
+
+The daily risk budget counts risk when an entry is sent, so 3 losing trades can't be followed by a 4th
+just because the losses are still small; the unfilled part of a cancelled entry is given back.
+
+## Morning scanner
+
+At 9:45 ET each day the bot adds up to `SCAN_TOP` (5) of Alpaca's most-active stocks to the watchlist:
+plain tickers, $10-$1000, not OTC, not leveraged/inverse/short funds, ranked by dollar volume. They get every
+gate above. Each scanned stock is its own "sector", so the sector cap won't stop e.g. MU + AMD + INTC
+together. The backtest can't replay this (past most-active lists aren't kept): paper-test it, or set
+`USE_SCANNER = False`.
+
+## Time machine
+
+`timemachine.py` takes the bot's plan (entry, stop, target as % of price) and the symbol's last 60 full
+sessions of 5-minute bars. Replays: 10,000 rest-of-days, each bar drawn from real bars at about the same
+time of day, ending at the target, the stop or the 15:50 flatten. History: the same plan entered at the same
+time on each real past session. Both go into the decision log, e.g.
+`TM 60d: replays target 24% / stop 63% / open 13%, avg -0.09R; history 15% / 63% / 22%, avg -0.22R`.
+It is the last 3 months, not a prediction. Set `TM_MIN_EXPECTED_R = 0.0` to use it as a filter.
 
 ## Run it unattended (Windows Task Scheduler)
 
@@ -72,7 +115,8 @@ Turn BTC off with `CRYPTO_WATCHLIST = []` in `config.py`.
   cap is replaced by `MAX_POSITION_USD` and risk-based sizing.
 - 10 minutes before the close the bot closes **every stock position** in the paper account,
   including ones you opened by hand. Crypto positions are left alone.
-- Opening and closing the same day counts as a day trade. Accounts under $25k are limited
-  by the pattern-day-trader rule.
+- Opening and closing the same day counts as a day trade. FINRA Regulatory Notice 26-10 (June 4, 2026) removed the $25k
+  pattern-day-trader minimum, but brokers can phase the change in until Oct 2027: check what Alpaca applies to your
+  account before trading live.
 - `.env` and `trades.db` are in OneDrive and sync to the cloud. Move the folder out of
   OneDrive if you don't want that.
