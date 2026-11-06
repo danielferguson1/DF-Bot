@@ -12,6 +12,8 @@ import os
 import re
 import threading
 import time
+import uuid
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta, timezone
 
 import msvcrt
@@ -20,7 +22,7 @@ import requests
 from dotenv import load_dotenv
 
 from alpaca.data.historical import CryptoHistoricalDataClient, StockHistoricalDataClient
-from alpaca.data.enums import MostActivesBy
+from alpaca.data.enums import Adjustment, DataFeed, MostActivesBy
 from alpaca.data.historical.news import NewsClient
 from alpaca.data.historical.screener import ScreenerClient
 from alpaca.data.requests import (CryptoBarsRequest, CryptoLatestQuoteRequest, MostActivesRequest, NewsRequest,
@@ -28,15 +30,16 @@ from alpaca.data.requests import (CryptoBarsRequest, CryptoLatestQuoteRequest, M
 from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 from alpaca.common.exceptions import APIError
 from alpaca.trading.client import TradingClient
-from alpaca.trading.enums import (AssetClass, OrderClass, OrderSide, OrderStatus, OrderType,
+from alpaca.trading.enums import (AssetClass, AssetStatus, OrderClass, OrderSide, OrderStatus, OrderType,
                                   QueryOrderStatus, TimeInForce)
-from alpaca.trading.requests import (GetOrdersRequest, LimitOrderRequest, StopLimitOrderRequest,
-                                     StopLossRequest, StopOrderRequest, TakeProfitRequest)
+from alpaca.trading.requests import (GetAssetsRequest, GetCalendarRequest, GetOrdersRequest, LimitOrderRequest,
+                                     StopLimitOrderRequest, StopLossRequest, StopOrderRequest, TakeProfitRequest)
 from alpaca.trading.stream import TradingStream
 
 import config
 import db
 import metrics
+import orb
 import strategy
 import timemachine
 
@@ -105,9 +108,13 @@ async def on_trade_update(data):
         return
     order = data.order
     side = getattr(order.side, "value", order.side)
+    client_id = getattr(order, "client_order_id", None) or ""
     db.log("fills", symbol=key(order.symbol), side=side, qty=float(data.qty), price=float(data.price),
-           order_id=str(order.id), event=event)
+           order_id=str(order.id), event=event, client_id=client_id)
     notify(f"[FILL] {side.upper()} {float(data.qty):g} {order.symbol} @ ${float(data.price):,.2f} ({event})")
+    if client_id.startswith(ORB_ENTRY):
+        # the protective stop goes in now, not at the next 5-minute scan; off the websocket thread
+        threading.Thread(target=ensure_orb_stop_safe, args=(order.symbol,), daemon=True).start()
 
 
 # ---------- market data ----------
@@ -334,6 +341,209 @@ def maybe_scan(now):
     notify(f"[SCAN] Added today: {', '.join(scanned) or 'none passed the filters'}")
 
 
+# ---------- ORB: opening-range breakout on stocks in play (orb.py has the rules) ----------
+
+ORB_ENTRY, ORB_STOP = "orb-e-", "orb-s-"   # client_order_id prefixes
+_orb_lock = threading.Lock()
+
+
+def is_orb(order) -> bool:
+    return (getattr(order, "client_order_id", None) or "").startswith(("orb-",))
+
+
+def _parallel(fn, items):
+    with ThreadPoolExecutor(config.ORB_WORKERS) as pool:
+        return list(pool.map(fn, items))
+
+
+def _open_bar(day, symbols, feed):
+    """The 9:30-9:35 bar of `day` for `symbols` -> DataFrame indexed by symbol."""
+    t0 = pd.Timestamp(day).tz_localize(NY) + pd.Timedelta(hours=9, minutes=30)
+
+    def one(batch):
+        df = data_client.get_stock_bars(StockBarsRequest(
+            symbol_or_symbols=batch, timeframe=TimeFrame(5, TimeFrameUnit.Minute),
+            start=t0, end=t0 + pd.Timedelta(minutes=5), feed=feed)).df
+        if not len(df):
+            return None
+        df = df.reset_index()
+        return df[df["timestamp"] == t0.tz_convert("UTC")].set_index("symbol")
+    parts = [x for x in _parallel(one, [symbols[i:i + 400] for i in range(0, len(symbols), 400)]) if x is not None]
+    return pd.concat(parts)[["open", "high", "low", "close", "volume"]] if parts else pd.DataFrame()
+
+
+def orb_prepare(today, past_sessions: list):
+    """The day's universe and each name's 14-day average opening volume. ~3-5 minutes; once per day.
+    past_sessions: the last 14+ trading dates before today."""
+    t0 = time.monotonic()
+    assets = trading_client.get_all_assets(GetAssetsRequest(asset_class=AssetClass.US_EQUITY,
+                                                            status=AssetStatus.ACTIVE))
+    plain = {a.symbol: a for a in assets if a.tradable and re.fullmatch(r"[A-Z]{1,5}", a.symbol)
+             and str(getattr(a.exchange, "value", a.exchange)) in ("NYSE", "NASDAQ", "ARCA", "AMEX", "BATS")}
+    syms = sorted(plain)
+    start = pd.Timestamp(past_sessions[0]).tz_localize(NY)
+    end = pd.Timestamp(today).tz_localize(NY)  # daily bars of past days only; SIP is free when > 15 min old
+
+    def daily(batch):
+        return data_client.get_stock_bars(StockBarsRequest(
+            symbol_or_symbols=batch, timeframe=TimeFrame.Day, start=start, end=end, feed=DataFeed.SIP,
+            adjustment=Adjustment.SPLIT)).df
+    parts = [df for df in _parallel(daily, [syms[i:i + 200] for i in range(0, len(syms), 200)]) if len(df)]
+    elig = orb.eligible(pd.concat(parts)[["open", "high", "low", "close", "volume"]], today)
+    names = sorted(elig.index)
+    # past opening bars from IEX, the same feed the bot sees live at 9:35 (free SIP is 15 minutes late)
+    opens = {d: _open_bar(d, names, config.DATA_FEED) for d in past_sessions[-14:]}
+    avg = orb.avg_open_volume(opens)
+    shortable = {s for s, a in plain.items() if a.shortable and a.easy_to_borrow}
+    state["orb"] = {"day": today, "elig": elig, "avg": avg, "shortable": shortable}
+    notify(f"[ORB] Universe ready for {today}: {len(elig)} eligible stocks, {len(avg)} with opening-volume "
+           f"history ({time.monotonic() - t0:.0f}s)")
+
+
+def orb_maybe_prepare(clock):
+    """Once per trading day, from ORB_PREPARE_AT New York time until the entry deadline."""
+    if config.STRATEGY != "orb":
+        return
+    now = et(clock.timestamp)
+    today = now.date()
+    session_today = clock.is_open or et(clock.next_open).date() == today
+    minutes = now.hour * 60 + now.minute
+    if (not session_today or (state.get("orb") or {}).get("day") == today
+            or not config.ORB_PREPARE_AT <= minutes < config.ORB_PLACE_BY):
+        return
+    cal = trading_client.get_calendar(GetCalendarRequest(start=today - timedelta(days=30), end=today))
+    past = [c.date for c in cal if c.date < today]
+    if len(past) < 15:
+        raise RuntimeError(f"only {len(past)} past sessions in Alpaca's calendar")
+    orb_prepare(today, past[-15:])
+
+
+def orb_place(ctx):
+    """After the 9:30 bar closes: rank, plan, size and send the day's stop entries. Once per day."""
+    now = et(ctx["now"])
+    today, minutes = now.date(), now.hour * 60 + now.minute
+    prep = state.get("orb") or {}
+    if state.get("orb_placed") == today or minutes < 9 * 60 + 35:
+        return
+    since = et_day_start(ctx["now"])
+    if db.orb_plans(since):           # placed earlier today (e.g. before a restart)
+        state["orb_placed"] = today
+        return
+    if minutes >= config.ORB_PLACE_BY or prep.get("day") != today:
+        state["orb_placed"] = today
+        notify(f"[ORB] No entries today: " + ("universe not ready" if prep.get("day") != today
+                                              else f"bot wasn't running at 9:35 (now {now:%H:%M})"))
+        return
+    if ctx["loss_hit"]:
+        state["orb_placed"] = today
+        return
+    bars = _open_bar(today, sorted(prep["elig"].index), config.DATA_FEED)
+    plans = orb.select(bars, prep["avg"], prep["elig"], prep["shortable"])
+    snaps = data_client.get_stock_snapshot(StockSnapshotRequest(
+        symbol_or_symbols=[p.symbol for p in plans], feed=config.DATA_FEED)) if plans else {}
+    ready, skipped = [], []
+    for p in plans:
+        p.qty = orb.size(p, ctx["equity"])
+        snap = snaps.get(p.symbol)
+        price = float(snap.latest_trade.price) if snap and snap.latest_trade else None
+        if p.qty < 1:
+            skipped.append(f"{p.symbol} (size < 1)")
+        elif price is None or orb.already_through(p, price):
+            skipped.append(f"{p.symbol} ({'no price' if price is None else f'already through at {price:.2f}'})")
+        else:
+            ready.append(p)
+    budget = ctx["last_equity"] * config.DAILY_RISK_PCT - ctx["risk_today"]
+    fitting = orb.trim_to_budget(ready, budget)
+    skipped += [f"{p.symbol} (daily risk budget)" for p in ready if p not in fitting]
+    placed = []
+    for p in fitting:
+        side = OrderSide.BUY if p.side == "long" else OrderSide.SELL
+        try:
+            order = trading_client.submit_order(StopOrderRequest(
+                symbol=p.symbol, qty=p.qty, side=side, time_in_force=TimeInForce.DAY, stop_price=p.trigger,
+                client_order_id=f"{ORB_ENTRY}{today:%Y%m%d}-{p.symbol}"))
+        except Exception as e:
+            skipped.append(f"{p.symbol} (rejected: {str(e)[:60]})")
+            continue
+        db.log("orders", symbol=p.symbol, side=side.value, qty=p.qty, limit_price=p.trigger, stop_price=p.stop,
+               order_id=str(order.id), note=f"entry: orb {p.side}")
+        placed.append(f"{p.symbol} {p.side} {p.qty} @ {p.trigger:.2f} stop {p.stop:.2f} (rvol {p.rvol:.1f})")
+    state["orb_placed"] = today
+    notify(f"[ORB] {len(placed)} entries placed from {len(plans)} stocks in play:\n  " + "\n  ".join(placed or ["none"])
+           + (f"\nSkipped: {', '.join(skipped)}" if skipped else ""))
+
+
+def ensure_orb_stop(symbol: str):
+    """Make the protective stop match the ORB position: right side, right qty, plan price. Commits the fill's
+    risk to today's budget. If the price is already past the stop, closes the position instead."""
+    with _orb_lock:
+        plan = db.orb_plans(et_day_start(datetime.now(timezone.utc))).get(key(symbol))
+        if plan is None:
+            return "no ORB plan today"
+        order_id, side, trigger, stop, _ = plan
+        try:
+            pos = trading_client.get_open_position(key(symbol))
+        except APIError as e:
+            if e.status_code == 404:
+                return "flat"
+            raise
+        qty = abs(float(pos.qty))
+        exit_side = OrderSide.SELL if side == "long" else OrderSide.BUY
+        stops = [o for o in open_orders(symbol) if o.side == exit_side and o.stop_price]
+        covered = sum(float(o.qty) for o in stops)
+        entry = float(pos.avg_entry_price)
+        logged = db.entry_risk(order_id)
+        logged_qty = logged[0] if logged else 0.0
+        if qty > logged_qty:   # new fill: its risk at the stop counts toward today's budget
+            db.log("risk", symbol=key(symbol), order_id=order_id, qty=qty - logged_qty,
+                   risk_usd=(qty - logged_qty) * abs(entry - stop), note="orb")
+        if abs(covered - qty) < 1e-9:
+            return "stop in place"
+        price = float(pos.current_price or entry)
+        if (side == "long" and price <= stop) or (side == "short" and price >= stop):
+            flatten(symbol)
+            return "already past the stop: closed"
+        for o in stops:
+            trading_client.cancel_order_by_id(o.id)
+        place_stop(symbol, qty, stop, exit_side, client_id=f"{ORB_STOP}{key(symbol)}-{uuid.uuid4().hex[:12]}")
+        db.log("orders", symbol=key(symbol), side=exit_side.value, qty=qty, stop_price=stop,
+               order_id=order_id, note="orb protective stop")
+        notify(f"[STOP] {symbol}: ORB {side} stop at ${stop:,.2f} for {qty:g} (entry fill ${entry:,.2f}, "
+               f"trigger ${trigger:,.2f})")
+        return f"placed stop {stop:.2f}"
+
+
+def ensure_orb_stop_safe(symbol: str):
+    """For the websocket thread: never let an exception kill it; the next scan retries."""
+    try:
+        ensure_orb_stop(symbol)
+    except Exception as e:
+        notify(f"[!] ORB stop for {symbol} failed ({type(e).__name__}: {e}). Retrying at the next scan.")
+
+
+def orb_cancel_pending(reason: str):
+    pending = [o for o in open_orders() if is_orb(o) and (o.client_order_id or "").startswith(ORB_ENTRY)]
+    for o in pending:
+        trading_client.cancel_order_by_id(o.id)
+    if pending:
+        notify(f"[ORB] Cancelled {len(pending)} pending entries: {reason}")
+
+
+def orb_cycle(ctx):
+    """Every scan while stocks trade: place the day's entries once, then keep each position's stop right."""
+    if ctx["loss_hit"]:
+        orb_cancel_pending("daily loss limit")
+    orb_place(ctx)
+    plans = db.orb_plans(et_day_start(ctx["now"]))
+    for sym in ctx["positions"]:
+        if sym in plans:
+            try:
+                ensure_orb_stop(sym)
+                state["symbol_errors"].pop(sym, None)
+            except Exception as e:
+                report_symbol_error(sym, e)
+
+
 # ---------- orders ----------
 
 def open_orders(symbol: str | None = None):
@@ -342,24 +552,31 @@ def open_orders(symbol: str | None = None):
     return [o for o in orders if symbol is None or key(o.symbol) == key(symbol)]
 
 
-def place_stop(symbol: str, qty: float, stop_price: float):
-    """Protective sell stop. Crypto only supports stop-limit, so its limit sits CRYPTO_STOP_LIMIT_GAP below."""
+def place_stop(symbol: str, qty: float, stop_price: float, side: OrderSide = OrderSide.SELL,
+               client_id: str | None = None):
+    """Protective stop: SELL for a long, BUY for a short. Crypto only supports stop-limit, so its limit sits
+    CRYPTO_STOP_LIMIT_GAP below."""
     if is_crypto(symbol):
         limit = strategy.round_to_increment(stop_price * (1 - config.CRYPTO_STOP_LIMIT_GAP), 0.01)
         req = StopLimitOrderRequest(symbol=symbol, qty=qty, side=OrderSide.SELL, time_in_force=TimeInForce.GTC,
                                     stop_price=stop_price, limit_price=limit)
     else:
-        req = StopOrderRequest(symbol=symbol, qty=qty, side=OrderSide.SELL, time_in_force=TimeInForce.GTC,
-                               stop_price=stop_price)
+        req = StopOrderRequest(symbol=symbol, qty=qty, side=side, time_in_force=TimeInForce.GTC,
+                               stop_price=stop_price, client_order_id=client_id)
     return trading_client.submit_order(req)
+
+
+def protective_stop(orders):
+    """(side, stop price) of the first stop order among a held symbol's open orders, or (None, None)."""
+    o = next((o for o in orders if o.stop_price and o.type in (OrderType.STOP, OrderType.STOP_LIMIT)), None)
+    return (o.side, float(o.stop_price)) if o else (None, None)
 
 
 def flatten(symbol: str):
     """Cancel open orders (they reserve the shares/coins), then close the position.
     If the close fails, put a stop back so the position is never left unprotected."""
     orders = open_orders(symbol)
-    stop_price = next((float(o.stop_price) for o in orders if o.side == OrderSide.SELL and o.stop_price
-                       and o.type in (OrderType.STOP, OrderType.STOP_LIMIT)), None)
+    stop_side, stop_price = protective_stop(orders)
     for o in orders:
         trading_client.cancel_order_by_id(o.id)
     for _ in range(10):
@@ -373,9 +590,9 @@ def flatten(symbol: str):
             db.log("orders", symbol=key(symbol), side="sell", note="close skipped: already closed")
             print(f"   {symbol} was already closed")
             return
-        restore_stop(symbol, stop_price, e)
+        restore_stop(symbol, stop_price, e, stop_side or OrderSide.SELL)
         raise
-    db.log("orders", symbol=key(symbol), side="sell", note="close position")
+    db.log("orders", symbol=key(symbol), side="close", note="close position")
     notify(f"[EXIT] Closing {symbol}")
 
 
@@ -390,13 +607,13 @@ def position_gone(symbol: str) -> bool:
         return False
 
 
-def restore_stop(symbol: str, stop_price: float | None, close_error: Exception):
+def restore_stop(symbol: str, stop_price: float | None, close_error: Exception, side: OrderSide = OrderSide.SELL):
     msg = f"[!] Close of {symbol} failed ({type(close_error).__name__}: {close_error})."
     try:
         if stop_price is None:
             raise ValueError("no previous stop price found")
         qty = abs(float(trading_client.get_open_position(key(symbol)).qty))
-        place_stop(symbol, qty, stop_price)
+        place_stop(symbol, qty, stop_price, side)
         notify(f"{msg} Re-placed stop at ${stop_price:,.2f}.")
     except Exception as e:
         notify(f"{msg} POSITION IS UNPROTECTED - could not re-place stop ({type(e).__name__}: {e}). "
@@ -469,6 +686,9 @@ def cancel_stale_entries(orders, now: datetime) -> list:
     pending = []
     for o in orders:
         if o.side != OrderSide.BUY:
+            continue
+        if is_orb(o):          # ORB entries wait for their trigger all day; the EOD close-out cancels them
+            pending.append(o)
             continue
         submitted = o.submitted_at or o.created_at  # submitted_at is optional in the SDK
         if submitted and now - submitted > timedelta(minutes=config.ENTRY_TIMEOUT_MIN):
@@ -698,7 +918,9 @@ def run_trading_cycle(clock, stocks: bool):
     }
 
     jobs = []  # (symbol, bars, spy_up)
-    if stocks:
+    if stocks and config.STRATEGY == "orb":
+        orb_cycle(ctx)
+    elif stocks:
         maybe_scan(now)
         # held stocks are always scanned, so a scanned stock still gets its SELL check after a restart
         held = [p.symbol for p in positions.values() if p.asset_class != AssetClass.CRYPTO]
@@ -737,8 +959,8 @@ def flatten_all_once(now):
     if state["flatten_day"] == now.date():
         return
     for o in open_orders():
-        if o.side == OrderSide.BUY and o.asset_class != AssetClass.CRYPTO:
-            trading_client.cancel_order_by_id(o.id)  # pending stock entries
+        if o.asset_class != AssetClass.CRYPTO and (o.side == OrderSide.BUY or is_orb(o)):
+            trading_client.cancel_order_by_id(o.id)  # pending stock entries (ORB shorts are sells)
             refund_unfilled_risk(o)  # crypto keeps trading tonight on the same daily budget
     failed = []
     for p in trading_client.get_all_positions():
@@ -814,12 +1036,12 @@ def main():
     stream.subscribe_trade_updates(on_trade_update)
     threading.Thread(target=stream.run, daemon=True).start()
 
-    notify("=== Bot started (paper): stocks in market hours"
+    notify(f"=== Bot started (paper): stocks ({config.STRATEGY}) in market hours"
            + (f", {', '.join(config.CRYPTO_WATCHLIST)} 24/7" if config.CRYPTO_WATCHLIST else "")
            + " === Press 'q' or 's' to stop.")
     if config.USE_LLM_VETO:
         check_ollama()
-    if config.USE_EARNINGS_CHECK and not earnings_check_on():
+    if config.STRATEGY != "orb" and config.USE_EARNINGS_CHECK and not earnings_check_on():
         notify("[!] Earnings check is OFF: no ALPHAVANTAGE_API_KEY in .env (free key: alphavantage.co). "
                "Only Qwen's headline check will catch earnings.")
     while True:
@@ -833,6 +1055,7 @@ def main():
                 flatten_all_once(now)  # raises on failure -> retried in 60s
                 stocks = False
             maybe_send_daily_summary(now)
+            orb_maybe_prepare(clock)  # once a day before the open; raises on failure -> retried in 60s
 
             if stocks or config.CRYPTO_WATCHLIST:
                 run_trading_cycle(clock, stocks)

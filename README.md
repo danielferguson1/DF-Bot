@@ -1,18 +1,24 @@
 # qwen-alpaca-bot
 
-Intraday paper-trading bot for Alpaca. Code-defined rules decide trades. Qwen (via Ollama)
-can only veto a BUY after reading the last 24h of headlines.
+Intraday paper-trading bot for Alpaca. Code-defined rules decide trades.
+
+- **Stocks** (`STRATEGY = "orb"`, the default): opening-range breakout on stocks in play, see below.
+  `STRATEGY = "sma_rsi"` switches back to the SMA/RSI rules on `WATCHLIST`, where Qwen (via Ollama) can veto a
+  BUY after reading the last 24h of headlines.
+- **Crypto** (BTC/USD): the SMA/RSI rules, 24/7, either way.
 
 | File | What it does |
 |---|---|
 | `config.py` | Every setting: watchlist, risk limits, ATR stop/target, spread limit, feed |
-| `strategy.py` | Indicators, BUY/SELL rules, entry window, cooldown, reward:risk, sizing (pure functions) |
+| `orb.py` | Stocks in play: universe, ranking, entry/stop prices, sizing (pure functions) |
+| `orb_report.py` | How ORB fills on paper: entry and stop slippage, realized R per trade |
+| `strategy.py` | SMA/RSI indicators, BUY/SELL rules, entry window, cooldown, reward:risk, sizing |
 | `timemachine.py` | Before each stock BUY: the plan replayed 10,000 times + on every past session (60 days) |
 | `bot.py` | Live loop: scans at each 5-min bar close, places bracket orders, logs, alerts |
 | `backtest.py` | Replays the same rules on history and compares with buy-and-hold SPY |
 | `report.py` | Paper-account performance (win rate, Sharpe, max drawdown) |
 | `db.py` | SQLite log in `trades.db`: decisions, orders, fills |
-| `test_strategy.py`, `test_bot.py` | Unit tests; offline, partly on real AAPL bars in `fixtures/` |
+| `test_strategy.py`, `test_bot.py`, `test_orb.py` | Unit tests; offline, partly on real AAPL bars in `fixtures/` |
 
 ## Setup
 
@@ -38,10 +44,34 @@ TELEGRAM_CHAT_ID=...
 2. `python backtest.py --days 60 --cost-bps 5`. If the strategy doesn't beat buy-and-hold
    after costs, change the rules in `strategy.py` before trading it.
 3. `python timemachine.py AAPL` to see the odds the bot would log for a BUY right now.
-4. `python bot.py` on paper for a few weeks. Press `q` to stop.
-5. `python report.py --period 1M` to check results.
+4. `python bot.py` on paper for a few weeks. Press `q` to stop. Start it before 9:00 ET on trading days.
+5. `python orb_report.py` (ORB fills) and `python report.py --period 1M` (account) to check results.
 
-## What a BUY has to pass
+## Stocks in play (ORB)
+
+From Zarattini, Barbon & Aziz (2023), "A Profitable Day Trading Strategy for the U.S. Equity Market".
+
+1. **9:00 ET**: the universe = US stocks with prior close > $5, 14-day average volume >= 1M shares and
+   14-day ATR > $0.50 (about 1,700 names), plus each one's 14-day average 9:30-9:35 volume. Takes about a minute.
+2. **9:35 ET**: rank by today's 9:30-9:35 volume / its average. For the top 20 above 1x: if that bar closed up,
+   a **buy stop** 1 cent above its high; if down, a **sell-short stop** 1 cent below its low (easy-to-borrow
+   names only). Skipped if the price is already through the trigger, or if it wouldn't fit the daily risk
+   budget. Size: 0.25% of equity at the stop, capped at $1,000 per position.
+3. **On the fill** (websocket): a protective stop `ORB_STOP_ATR` (0.10) x ATR beyond the trigger, held by Alpaca.
+   Every scan re-checks that each ORB position has its stop (right side and size).
+4. **15:50**: everything still open is closed; unfilled entries are cancelled. No target.
+
+Not applied to ORB: the earnings check, Qwen, the time machine and the cooldown (stocks in play are usually
+news or earnings days, which is the point). Applied: the daily loss limit (it also cancels pending ORB entries)
+and the daily risk budget.
+
+**Why paper only.** A 2-year, whole-market test (`C:\Users\06dan\qwen-bot-research`) put this setup between
+-0.46R and +0.20R per trade in the holdout year after 5 bps/side, depending on fills that 1-minute bars can't
+settle. Live, the bot ranks on IEX volume (the free feed), which picks different names than the full tape the
+research used (6 of 19 in common on 2026-11-06). `orb_report.py` measures the real slippage and R. Expect a
+few hundred closed trades (several weeks) before the number means much.
+
+## What an SMA/RSI or crypto BUY has to pass
 
 In order; the first one that fails is logged as the reason (`trades.db`, table `decisions`).
 

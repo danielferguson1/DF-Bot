@@ -22,6 +22,10 @@ def _connect():
 def init():
     with closing(_connect()) as conn:
         conn.executescript(SCHEMA)
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(fills)")}
+        if "client_id" not in cols:  # added for the ORB fill report; older trades.db files get it here
+            conn.execute("ALTER TABLE fills ADD COLUMN client_id TEXT")
+            conn.commit()
 
 
 def log(table: str, **row):
@@ -48,19 +52,22 @@ def count_since(table: str, since: str, column: str, like: str) -> int:
 
 
 def risk_today(since: str) -> tuple[float, int]:
-    """(risk committed by entries since `since`, net of refunds; number of entries since `since`)."""
+    """(risk committed since `since` by all entries, net of refunds; number of SMA/RSI and crypto entries since
+    `since`; ORB fills are logged with note 'orb' and don't count toward MAX_ENTRIES_PER_DAY)."""
     with closing(_connect()) as conn:
         total, entries = conn.execute(
-            "SELECT COALESCE(SUM(risk_usd), 0), COALESCE(SUM(risk_usd > 0), 0) FROM risk WHERE ts >= ?",
+            "SELECT COALESCE(SUM(risk_usd), 0), COALESCE(SUM(risk_usd > 0 AND note = 'entry'), 0) "
+            "FROM risk WHERE ts >= ?",
             (since,)).fetchone()
     return float(total), int(entries)
 
 
 def entry_risk(order_id: str):
-    """(qty, risk_usd) logged for an entry order, or None."""
+    """(qty, risk_usd) committed for an entry order (summed over its fills), or None."""
     with closing(_connect()) as conn:
-        return conn.execute("SELECT qty, risk_usd FROM risk WHERE order_id = ? AND risk_usd > 0",
-                            (order_id,)).fetchone()
+        row = conn.execute("SELECT SUM(qty), SUM(risk_usd) FROM risk WHERE order_id = ? AND risk_usd > 0",
+                           (order_id,)).fetchone()
+    return row if row and row[0] is not None else None
 
 
 def last_activity(symbol: str):
@@ -70,3 +77,11 @@ def last_activity(symbol: str):
             "SELECT MAX(ts) FROM (SELECT ts FROM risk WHERE symbol = ? AND risk_usd > 0 "
             "UNION ALL SELECT ts FROM fills WHERE symbol = ? AND side = 'sell')",
             (symbol, symbol)).fetchone()[0]
+
+
+def orb_plans(since: str) -> dict:
+    """Today's ORB entries: {symbol: (order_id, side 'long'/'short', trigger, stop, qty)}."""
+    with closing(_connect()) as conn:
+        rows = conn.execute("SELECT symbol, order_id, note, limit_price, stop_price, qty FROM orders "
+                            "WHERE ts >= ? AND note LIKE 'entry: orb %' ORDER BY ts", (since,)).fetchall()
+    return {s: (oid, note.split()[-1], trig, stop, qty) for s, oid, note, trig, stop, qty in rows}

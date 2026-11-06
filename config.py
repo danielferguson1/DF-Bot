@@ -72,4 +72,23 @@ SCAN_MIN_PRICE = 10.0
 SCAN_MAX_PRICE = 1000.0     # must stay under MAX_POSITION_USD to buy at least 1 share
 SCAN_EXCLUDE_NAME = r"\b[23]x\b|ultra|leveraged|inverse|\bshort\b|\bbull\b|\bbear\b|warrant|\bunits?\b|\bright"
 
-DB_PATH =Path(__file__).with_name("trades.db")
+# Stock strategy. "orb" = opening-range breakout on stocks in play (Zarattini, Barbon & Aziz 2023); the SMA/RSI
+# rules ("sma_rsi") then don't trade stocks, and WATCHLIST / scanner / time machine are not used for stocks.
+# Crypto keeps its own rules either way.
+# Research (2 years, whole market, C:\Users\06dan\qwen-bot-research): no edge was proven that survives realistic
+# fills and costs. Run it on PAPER to measure real fills and slippage: python orb_report.py
+STRATEGY = "orb"
+ORB_TOP = 20                    # stocks in play per day, by relative opening volume
+ORB_SIDES = ("long", "short")   # long if the 9:30 bar closed up (buy stop above its high), short if down
+ORB_STOP_ATR = 0.10             # protective stop distance in 14-day daily ATRs (the paper's)
+ORB_RISK_PCT = 0.0025           # equity risked per trade at the stop, before the position cap
+ORB_POSITION_USD = 1000         # cap per position
+ORB_MIN_PRICE = 5.0             # prior close and today's open
+ORB_MIN_AVG_VOLUME = 1_000_000  # 14-day average daily volume (consolidated tape)
+ORB_MIN_ATR = 0.50              # 14-day daily ATR, $
+ORB_MIN_RVOL = 1.0              # today's 9:30-9:35 volume vs its 14-day average (IEX, the live feed)
+ORB_PREPARE_AT = 9 * 60         # minutes after midnight ET: build the day's universe (takes a few minutes)
+ORB_PLACE_BY = 9 * 60 + 45      # entries go in after the 9:30 bar closes; skipped for the day after this
+ORB_WORKERS = 8                 # parallel data requests (Alpaca allows 200/min)
+
+DB_PATH = Path(__file__).with_name("trades.db")
