@@ -81,8 +81,9 @@ class DailySummary(BotTestCase):
         bot.db.fills.return_value = [("AAPL", "buy", 10, 100, "a"), ("AAPL", "sell", 10, 115, "b"),
                                      ("MSFT", "buy", 5, 200, "c"), ("MSFT", "sell", 5, 190, "d")]
         bot.db.count_since.side_effect = lambda table, *_: {"orders": 2, "decisions": 1}[table]
-        bot.maybe_send_daily_summary(CLOSE_OUT + timedelta(minutes=2))
-        bot.maybe_send_daily_summary(CLOSE_OUT + timedelta(minutes=3))  # already sent
+        with mock.patch.object(bot, "llm_in_use", return_value=True):   # the Qwen line only shows when it's used
+            bot.maybe_send_daily_summary(CLOSE_OUT + timedelta(minutes=2))
+            bot.maybe_send_daily_summary(CLOSE_OUT + timedelta(minutes=3))  # already sent
 
         self.assertEqual(len(self.notes), 1)
         msg = self.notes[0]

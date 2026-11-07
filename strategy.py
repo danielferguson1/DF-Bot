@@ -98,6 +98,12 @@ def reward_risk(entry: float, stop: float, target: float) -> float:
     return (target - entry) / risk if risk > 0 else 0.0
 
 
+def cost_in_r(entry: float, stop: float, bps_per_side: float) -> float:
+    """Round-trip cost (both sides, bps_per_side each) as a multiple of the risk to the stop; inf if no risk."""
+    risk = entry - stop
+    return 2 * bps_per_side / 1e4 * entry / risk if risk > 0 else math.inf
+
+
 def in_entry_window(et_time) -> bool:
     """Stocks: no entries in the first NO_ENTRY_MINUTES_AFTER_OPEN minutes after 9:30 New York time.
     et_time: a datetime/Timestamp in America/New_York (the time the order would be sent)."""

@@ -1,9 +1,11 @@
-"""Paper-trading bot: US stocks during market hours, plus BTC/USD 24/7. Rules in strategy.py, settings in config.py.
+"""Paper-trading bot for Alpaca. Settings in config.py; code decides every trade.
 
-Code decides trades. Qwen can only veto a BUY after reading recent headlines.
-Stocks: every entry is a bracket order, so Alpaca holds the stop and target.
-Crypto: Alpaca has no brackets for crypto, so each fill gets a stop-limit order (re-checked every
-scan) and the take-profit is checked in code at each bar close.
+Day trading (STRATEGY = "momentum", default): intraday momentum on one ETF every 30 minutes (rules in momentum.py).
+Swing (default): index ETFs held for days to months, decided once a day at 15:45 ET (rules in swing.py).
+Other intraday rules (STRATEGY): opening-range breakout (orb.py) or SMA/RSI (strategy.py), flat by the close.
+Crypto (TRADE_CRYPTO): SMA/RSI on BTC/USD 24/7. Alpaca has no brackets for crypto, so each fill gets a stop-limit
+order (re-checked every scan) and the take-profit is checked in code at each bar close.
+Qwen can only veto an SMA/RSI or crypto BUY after reading recent headlines.
 """
 import csv
 import io
@@ -33,14 +35,17 @@ from alpaca.trading.client import TradingClient
 from alpaca.trading.enums import (AssetClass, AssetStatus, OrderClass, OrderSide, OrderStatus, OrderType,
                                   QueryOrderStatus, TimeInForce)
 from alpaca.trading.requests import (GetAssetsRequest, GetCalendarRequest, GetOrdersRequest, LimitOrderRequest,
-                                     StopLimitOrderRequest, StopLossRequest, StopOrderRequest, TakeProfitRequest)
+                                     MarketOrderRequest, StopLimitOrderRequest, StopLossRequest, StopOrderRequest,
+                                     TakeProfitRequest)
 from alpaca.trading.stream import TradingStream
 
 import config
 import db
 import metrics
+import momentum
 import orb
 import strategy
+import swing
 
 load_dotenv()
 API_KEY, SECRET_KEY = os.getenv("ALPACA_API_KEY"), os.getenv("ALPACA_SECRET_KEY")
@@ -67,6 +72,21 @@ CRYPTO_KEYS = {key(s) for s in config.CRYPTO_WATCHLIST}
 
 def is_crypto(symbol: str) -> bool:
     return key(symbol) in CRYPTO_KEYS
+
+
+def crypto_symbols() -> list[str]:
+    """Crypto symbols to trade: none unless TRADE_CRYPTO."""
+    return config.CRYPTO_WATCHLIST if config.TRADE_CRYPTO else []
+
+
+def swing_symbols() -> set:
+    """Symbols the swing rules own while SWING is on: intraday rules leave them alone and the close-out keeps them."""
+    return set(swing.symbols()) if config.SWING else set()
+
+
+def llm_in_use() -> bool:
+    """Qwen only checks SMA/RSI and crypto BUYs."""
+    return config.USE_LLM_VETO and (config.STRATEGY == "sma_rsi" or bool(crypto_symbols()))
 
 
 def sector(symbol: str) -> str:
@@ -282,7 +302,7 @@ def scan_watchlist() -> list[str]:
     """Alpaca's most-active stocks, filtered to plain, liquid, affordable US shares, ranked by dollar volume."""
     actives = screener_client.get_most_actives(
         MostActivesRequest(top=config.SCAN_CANDIDATES, by=MostActivesBy.VOLUME)).most_actives
-    known = {key(s) for s in config.WATCHLIST}
+    known = {key(s) for s in config.WATCHLIST} | swing_symbols()
     candidates = [a for a in actives if re.fullmatch(r"[A-Z]{1,5}", a.symbol) and a.symbol not in known]
     if not candidates:
         return []
@@ -361,7 +381,8 @@ def orb_prepare(today, past_sessions: list):
     assets = trading_client.get_all_assets(GetAssetsRequest(asset_class=AssetClass.US_EQUITY,
                                                             status=AssetStatus.ACTIVE))
     plain = {a.symbol: a for a in assets if a.tradable and re.fullmatch(r"[A-Z]{1,5}", a.symbol)
-             and str(getattr(a.exchange, "value", a.exchange)) in ("NYSE", "NASDAQ", "ARCA", "AMEX", "BATS")}
+             and str(getattr(a.exchange, "value", a.exchange)) in ("NYSE", "NASDAQ", "ARCA", "AMEX", "BATS")
+             and a.symbol not in swing_symbols()}   # one Alpaca position per symbol: swing owns its ETFs
     syms = sorted(plain)
     start = pd.Timestamp(past_sessions[0]).tz_localize(NY)
     end = pd.Timestamp(today).tz_localize(NY)  # daily bars of past days only; SIP is free when > 15 min old
@@ -524,6 +545,234 @@ def orb_cycle(ctx):
                 state["symbol_errors"].pop(sym, None)
             except Exception as e:
                 report_symbol_error(sym, e)
+
+
+# ---------- swing: index ETFs held for days to months (swing.py has the rules) ----------
+
+SWING_PREFIX = "swg-"   # client_order_id prefix
+_fractionable = {}
+
+
+def fractionable(symbol: str) -> bool:
+    if symbol not in _fractionable:
+        _fractionable[symbol] = bool(trading_client.get_asset(symbol).fractionable)
+    return _fractionable[symbol]
+
+
+def swing_closes(symbols: list[str], today) -> pd.DataFrame:
+    """Daily closes of the sessions before `today` (New York date), date x symbol, adjusted for splits and dividends
+    like the backtest. Consolidated tape (free once 15 minutes old)."""
+    start = pd.Timestamp(today - timedelta(days=config.SWING_HISTORY_DAYS)).tz_localize(NY)
+    raw = data_client.get_stock_bars(StockBarsRequest(
+        symbol_or_symbols=symbols, timeframe=TimeFrame.Day, start=start, end=pd.Timestamp(today).tz_localize(NY),
+        feed=DataFeed.SIP, adjustment=Adjustment.ALL)).df
+    if raw.empty:
+        return pd.DataFrame()
+    closes = raw["close"].unstack(0)
+    closes.index = pd.DatetimeIndex(closes.index.tz_convert(NY).date)
+    return closes[closes.index < pd.Timestamp(today)]
+
+
+def swing_cycle(ctx):
+    """Once a day, from SWING_RUN_MINUTES_BEFORE_CLOSE minutes before the close until the stock close-out: targets
+    from past daily closes plus the live price as today's close, then market orders for the gaps. Held overnight.
+    Raises if a symbol couldn't be handled, so the main loop retries within the window (symbols already at their
+    target, or with an order still open, are left alone on the retry)."""
+    now = ctx["now"]
+    today = et(now).date()
+    if (not config.SWING or state.get("swing_day") == today
+            or not config.FLATTEN_MINUTES_BEFORE_CLOSE < ctx["minutes_to_close"] <= config.SWING_RUN_MINUTES_BEFORE_CLOSE):
+        return
+    syms = swing.symbols()
+    cal = trading_client.get_calendar(GetCalendarRequest(start=today - timedelta(days=10), end=today))
+    prev_session = max(c.date for c in cal if c.date < today)
+    closes = swing_closes(syms, today)
+    snaps = data_client.get_stock_snapshot(StockSnapshotRequest(symbol_or_symbols=syms, feed=config.DATA_FEED))
+    problems, live = [], {}
+    need = config.SWING_TREND_SMA + 20
+    for s in syms:
+        recent = closes[s].iloc[-need:] if s in closes else pd.Series(dtype=float)
+        trade = getattr(snaps.get(s), "latest_trade", None)
+        # a short or gapped history would read as "below the 200-day average" (NaN) and sell: never act on one
+        if len(recent) < need or recent.isna().any() or recent.index[-1].date() != prev_session:
+            problems.append(f"{s}: daily bars missing or not up to {prev_session}")
+        elif trade is None or float(trade.price) <= 0 or now - trade.timestamp > timedelta(minutes=15):
+            problems.append(f"{s}: no fresh price")
+        else:
+            live[s] = float(trade.price)
+    hist = closes[list(live)].copy() if live else pd.DataFrame()
+    if live:
+        hist.loc[pd.Timestamp(today)] = [live[s] for s in hist.columns]   # the live price stands in for today's close
+    busy = {key(o.symbol) for o in open_orders()}   # orders before positions: a fill in between can't double-trade
+    held = {key(p.symbol): float(p.qty) for p in trading_client.get_all_positions()}
+    target = swing.today_targets(hist, ctx["equity"], {s: held.get(s, 0.0) * live[s] for s in live}) if live else {}
+    plan = swing.orders(target, ctx["equity"], live, held, {s: fractionable(s) for s in live})
+
+    lines, failed, placed = [], [], 0
+    for s in live:
+        x = swing.explain(hist[s])
+        dip = ""
+        if x["dip"]:
+            trend_w = config.SWING_TREND_WEIGHT if s == config.SWING_TREND_SYMBOL and x["trend"] else 0.0
+            dip = (", dip trade on" if target[s] - trend_w > swing.dip_slot() / 2
+                   else ", dip trade running but not joined (it started before the bot held it)")
+        lines.append(f"{s} ${x['price']:,.2f}: trend {'in' if x['trend'] else 'out'} (200d ${x['sma_trend']:,.2f}), "
+                     f"RSI(2) {x['rsi2']:.0f}{dip} -> {target[s]:.1%} of equity")
+        db.log("decisions", symbol=s, action=f"TARGET {target[s]:.1%}", price=x["price"],
+               detail=f"swing sma{config.SWING_TREND_SMA}={x['sma_trend']:.2f} sma{config.SWING_DIP_EXIT_SMA}="
+                      f"{x['sma_exit']:.2f} rsi2={x['rsi2']:.1f} trend={x['trend']} dip={x['dip']} "
+                      f"held={held.get(s, 0.0):g}")
+    for s, qty in plan:
+        if s in busy:
+            lines.append(f"{s}: an order is already open, left alone")
+            continue
+        side = OrderSide.BUY if qty > 0 else OrderSide.SELL
+        try:
+            if target[s] <= 0:
+                order = trading_client.close_position(s)   # the whole position, fractional part included
+            else:
+                order = trading_client.submit_order(MarketOrderRequest(
+                    symbol=s, qty=abs(qty), side=side, time_in_force=TimeInForce.DAY,
+                    client_order_id=f"{SWING_PREFIX}{today:%Y%m%d}-{s}-{uuid.uuid4().hex[:8]}"))
+        except Exception as e:
+            failed.append(f"{s}: {type(e).__name__}: {e}")
+            continue
+        placed += 1
+        db.log("orders", symbol=s, side=side.value, qty=abs(qty), limit_price=live[s], order_id=str(order.id),
+               note=f"swing: market, target {target[s]:.1%}")
+        lines.append(f"{side.value.upper()} {abs(qty):g} {s} (~${abs(qty) * live[s]:,.0f})")
+    if live and not plan:
+        lines.append("no orders: positions already match the targets")
+    if placed or state.get("swing_tried") != today:   # a retry only reports what it changed
+        notify("[SWING] " + "\n  ".join(lines or ["nothing to decide"]))
+    state["swing_tried"] = today
+    if problems or failed:
+        raise RuntimeError("swing: " + "; ".join(problems + failed))
+    state["swing_day"] = today
+
+
+# ---------- momentum: intraday trend on one ETF (momentum.py has the rules) ----------
+
+MOM_PREFIX = "mom-"   # client_order_id prefix
+_mom = {}             # today's session times, yesterday's close and noise area; rebuilt each session
+
+
+def momentum_prepare(now) -> dict:
+    """Once a session: today's open and length, yesterday's close and the noise area from the last
+    MOMENTUM_LOOKBACK sessions of 1-minute bars (consolidated tape, as backtested; free once 15 minutes old)."""
+    today = et(now).date()
+    if _mom.get("day") == today:
+        return _mom
+    sym = config.MOMENTUM_SYMBOL
+    cal = trading_client.get_calendar(GetCalendarRequest(start=today - timedelta(days=45), end=today))
+    if not cal or cal[-1].date != today:
+        raise RuntimeError(f"momentum: {today} is not a session in Alpaca's calendar")
+    past = cal[-1 - config.MOMENTUM_LOOKBACK:-1]
+    start, end = momentum.session_bounds(past[0])[0], momentum.session_bounds(past[-1])[1]
+    raw = data_client.get_stock_bars(StockBarsRequest(symbol_or_symbols=sym, timeframe=TimeFrame.Minute,
+                                                      start=start, end=end, feed=DataFeed.SIP)).df
+    bars = raw.loc[sym] if len(raw) else pd.DataFrame()
+    t = bars.index.tz_convert(NY) if len(bars) else pd.DatetimeIndex([], tz=NY)
+    sessions = []
+    for c in past:
+        o_ts, c_ts = momentum.session_bounds(c)
+        b = bars[(t >= o_ts) & (t < c_ts)]
+        minutes = int((c_ts - o_ts).total_seconds() // 60)
+        if len(b) < 0.9 * minutes:   # never build the noise area on a patchy history
+            raise RuntimeError(f"momentum: {sym} 1-minute bars missing on {c.date} ({len(b)} of {minutes})")
+        sessions.append((momentum.session_open(b, o_ts), momentum.minute_prices(b, o_ts, minutes)))
+    o_ts, c_ts = momentum.session_bounds(cal[-1])
+    _mom.clear()
+    _mom.update(day=today, open=o_ts, length=int((c_ts - o_ts).total_seconds() // 60),
+                sigma=momentum.sigma(sessions), prev=float(sessions[-1][1][-1]), done=set(), shares=None)
+    return _mom
+
+
+def momentum_trade(sym: str, held: float, goal: int, price: float, today) -> list[str]:
+    """Market orders from `held` to `goal` shares. A flip goes in two steps, because Alpaca won't sell more than a
+    long holds (or buy more than a short owes) in one order: the close must fill before the new side opens."""
+    if open_orders(sym):
+        raise RuntimeError(f"momentum: an order in {sym} is still open; not adding another")
+    done = []
+    if held and (goal == 0 or (held > 0) != (goal > 0)):
+        order = trading_client.close_position(key(sym))   # the whole position, fractional part included
+        filled = wait_for_order(order.id)
+        db.log("orders", symbol=key(sym), side="sell" if held > 0 else "buy", qty=abs(held), limit_price=price,
+               order_id=str(order.id), note="momentum: exit")
+        if filled < abs(held) - 1e-9:
+            raise RuntimeError(f"momentum: closing {sym} filled {filled:g} of {abs(held):g}")
+        done.append(f"{'SELL' if held > 0 else 'BUY'} {abs(held):g} to close")
+        held = 0
+    if goal != held:
+        qty, side = abs(goal - held), OrderSide.BUY if goal > held else OrderSide.SELL
+        order = trading_client.submit_order(MarketOrderRequest(
+            symbol=sym, qty=qty, side=side, time_in_force=TimeInForce.DAY,
+            client_order_id=f"{MOM_PREFIX}{today:%Y%m%d}-{uuid.uuid4().hex[:8]}"))
+        db.log("orders", symbol=key(sym), side=side.value, qty=qty, limit_price=price, order_id=str(order.id),
+               note=f"entry: momentum {'long' if goal > 0 else 'short'}")
+        done.append(f"{side.value.upper()} {qty:g}")
+    return done
+
+
+def momentum_cycle(ctx):
+    """Decides within 5 minutes of each check time, from today's 1-minute bars on the free real-time feed (IEX: the
+    same decision as the consolidated tape at 99% of checks in a 2-year test): the opening trade, VWAP and the latest
+    close. Trades the gap to the target. Not subject to the daily loss limit or risk budget (it wasn't backtested
+    with them); its risk is the size and the trailing stops. The close-out flattens it; a position still open from an
+    earlier session (the bot was off at the close-out) is closed before the first decision. Raises on missing or
+    stale data, so the main loop retries in 60s while the check is still due."""
+    if config.STRATEGY != "momentum":
+        return
+    sym = config.MOMENTUM_SYMBOL
+    now = et(ctx["now"])
+    st = momentum_prepare(ctx["now"])
+    minutes = (now - st["open"]).total_seconds() / 60
+    pos = ctx["positions"].get(key(sym))
+    held = float(pos.qty) if pos else 0.0
+    checks = momentum.check_minutes(st["length"])
+    if held and minutes < checks[0] and not st["done"]:
+        flatten(sym)
+        notify(f"[MOMENTUM] Closed {held:g} {sym} left open from an earlier session (the bot missed a close-out).")
+        return
+    due = [m for m in checks if m <= minutes < m + 5 and m not in st["done"]]
+    if not due:
+        return
+    m = due[-1]
+    raw = data_client.get_stock_bars(StockBarsRequest(symbol_or_symbols=sym, timeframe=TimeFrame.Minute,
+                                                      start=st["open"], end=ctx["now"], feed=config.DATA_FEED)).df
+    bars = raw.loc[sym] if len(raw) else pd.DataFrame()
+    if bars.empty or bars.index[0].tz_convert(NY) - st["open"] > timedelta(minutes=5):
+        raise RuntimeError(f"momentum: no {sym} bars from today's open yet")
+    last_end = bars.index[-1].tz_convert(NY) + timedelta(minutes=1)
+    if now - last_end > timedelta(minutes=3):
+        raise RuntimeError(f"momentum: latest {sym} bar ended at {last_end:%H:%M}, too old to decide on")
+    k = min(int((last_end - st["open"]).total_seconds() // 60) - 1, st["length"] - 1)
+    price = momentum.minute_prices(bars, st["open"], st["length"])[k]
+    vwap = momentum.vwap_by_minute(bars, st["open"], st["length"])[k]
+    o, sig = momentum.session_open(bars, st["open"]), st["sigma"][k]
+    if pd.isna(sig) or pd.isna(price) or pd.isna(vwap):
+        st["done"].add(m)
+        print(f"-> {sym}: momentum {now:%H:%M} skipped (no noise area or price at minute {k + 1})")
+        return
+    if st["shares"] is None:
+        st["shares"] = momentum.shares(ctx["last_equity"], o)
+    upper, lower = momentum.bands(o, st["prev"], sig)
+    want = momentum.target(price, vwap, upper, lower)
+    goal = want * st["shares"]
+    db.log("decisions", symbol=key(sym), action=f"TARGET {goal:+d}", price=price,
+           detail=f"momentum {now:%H:%M} upper={upper:.2f} lower={lower:.2f} vwap={vwap:.2f} sigma={sig:.4%} "
+                  f"open={o:.2f} prev={st['prev']:.2f} held={held:g}")
+    where = (f"above the upper band ${upper:,.2f} and VWAP ${vwap:,.2f}" if want > 0 else
+             f"below the lower band ${lower:,.2f} and VWAP ${vwap:,.2f}" if want < 0 else
+             f"inside the noise area (${lower:,.2f}-${upper:,.2f}) or on the wrong side of VWAP ${vwap:,.2f}")
+    if goal == held:
+        st["done"].add(m)
+        print(f"-> {sym}: momentum {now:%H:%M} ${price:,.2f} {where}: hold {held:g}")
+        return
+    done = momentum_trade(sym, held, goal, price, now.date())   # raises on a failure: retried while still due
+    st["done"].add(m)
+    label = f"long {goal}" if goal > 0 else f"short {-goal}" if goal < 0 else "flat"
+    notify(f"[MOMENTUM] {now:%H:%M} {sym} ${price:,.2f}: {where} -> {label} ({', '.join(done)})")
 
 
 # ---------- orders ----------
@@ -716,7 +965,7 @@ def try_enter(symbol, row, ctx) -> str:
     if sum(sector(s) == sec for s in holdings) >= config.MAX_PER_SECTOR:
         return f"skip: sector cap ({sec})"
     side = market_side(symbol)
-    if side and any(market_side(s) == -side for s in holdings):
+    if side and any(market_side(s) == -side for s in holdings | ctx.get("swing_held", set())):
         return "skip: opposite index fund held (would cancel out)"
     if ctx["entries_today"] >= config.MAX_ENTRIES_PER_DAY:
         return f"skip: {config.MAX_ENTRIES_PER_DAY} entries already today"
@@ -758,6 +1007,9 @@ def try_enter(symbol, row, ctx) -> str:
     rr = strategy.reward_risk(ask, stop, target)
     if rr < config.MIN_REWARD_RISK:
         return f"skip: reward:risk {rr:.2f} < {config.MIN_REWARD_RISK}"
+    cost_r = strategy.cost_in_r(ask, stop, config.CRYPTO_COST_BPS if crypto else config.STOCK_COST_BPS)
+    if cost_r > config.MAX_COST_R:
+        return f"skip: round-trip costs {cost_r:.2f}R > {config.MAX_COST_R}R of the risk"
     risk = qty * (ask - stop)
     budget = ctx["last_equity"] * config.DAILY_RISK_PCT
     if ctx["risk_today"] + risk > budget:
@@ -869,8 +1121,8 @@ def run_trading_cycle(clock, stocks: bool):
     minutes_to_close = (clock.next_close - now).total_seconds() / 60
     what = f"stocks ({minutes_to_close:.0f} min to close)" if stocks else "stocks closed"
     print(f"\n[{now.astimezone():%Y-%m-%d %H:%M:%S}] Scan: {what}"
-          + (f", crypto {', '.join(config.CRYPTO_WATCHLIST)}" if config.CRYPTO_WATCHLIST else ""))
-    if config.USE_LLM_VETO and state["news_down"]:
+          + (f", crypto {', '.join(crypto_symbols())}" if crypto_symbols() else ""))
+    if llm_in_use() and state["news_down"]:
         check_ollama()  # sends the recovery alert once Ollama is back
 
     account = trading_client.get_account()
@@ -878,16 +1130,20 @@ def run_trading_cycle(clock, stocks: bool):
     loss_hit = equity <= last_equity * (1 - config.DAILY_LOSS_PCT)
     if loss_hit and state["loss_alert_day"] != now.date():
         state["loss_alert_day"] = now.date()
-        notify(f"[RISK] Daily loss limit hit (equity ${equity:,.2f} vs ${last_equity:,.2f}). No new entries today.")
+        exempt = [n for n, on in (("swing", config.SWING), ("momentum", config.STRATEGY == "momentum")) if on]
+        notify(f"[RISK] Daily loss limit hit (equity ${equity:,.2f} vs ${last_equity:,.2f}). No new ORB, SMA/RSI or "
+               f"crypto entries today" + (f"; the {' and '.join(exempt)} rules still run." if exempt else "."))
 
-    positions = {key(p.symbol): p for p in trading_client.get_all_positions()}
-    pending = cancel_stale_entries(open_orders(), now)
+    keep = swing_symbols()   # swing positions follow their own rules, not the intraday caps below
+    all_positions = {key(p.symbol): p for p in trading_client.get_all_positions()}
+    positions = {k: p for k, p in all_positions.items() if k not in keep}
+    pending = cancel_stale_entries([o for o in open_orders() if key(o.symbol) not in keep], now)
     risk_today, entries_today = db.risk_today(et_day_start(now))
     ctx = {
         "now": now, "equity": equity, "last_equity": last_equity, "loss_hit": loss_hit,
         "minutes_to_close": minutes_to_close, "next_session": et(clock.next_open).date(),
         "risk_today": risk_today, "entries_today": entries_today,
-        "positions": positions,
+        "positions": positions, "swing_held": set(all_positions) & keep,
         "pending_symbols": {key(o.symbol) for o in pending},
         "exposure": sum(abs(float(p.market_value)) for p in positions.values())
                     + sum(float(o.qty) * float(o.limit_price or 0) for o in pending),
@@ -896,11 +1152,11 @@ def run_trading_cycle(clock, stocks: bool):
     jobs = []  # (symbol, bars, spy_up)
     if stocks and config.STRATEGY == "orb":
         orb_cycle(ctx)
-    elif stocks:
+    elif stocks and config.STRATEGY == "sma_rsi":
         maybe_scan(now)
         # held stocks are always scanned, so a scanned stock still gets its SELL check after a restart
         held = [p.symbol for p in positions.values() if p.asset_class != AssetClass.CRYPTO]
-        watch = list(dict.fromkeys(config.WATCHLIST + state["scanned"] + held))
+        watch = [s for s in dict.fromkeys(config.WATCHLIST + state["scanned"] + held) if key(s) not in keep]
         bars = fetch_stock_bars(sorted(set(watch) | {config.REGIME_SYMBOL}), now)
         spy = bars.get(config.REGIME_SYMBOL)
         if spy is None or spy.empty or not strategy.bar_is_fresh(spy.index[-1], now):
@@ -908,9 +1164,9 @@ def run_trading_cycle(clock, stocks: bool):
         else:
             spy_up = strategy.regime_up(spy.iloc[-1])
             jobs += [(s, bars.get(s), spy_up) for s in watch]
-    if config.CRYPTO_WATCHLIST:
-        cbars = fetch_crypto_bars(config.CRYPTO_WATCHLIST, now)
-        jobs += [(s, cbars.get(s), None) for s in config.CRYPTO_WATCHLIST]
+    if crypto_symbols():
+        cbars = fetch_crypto_bars(crypto_symbols(), now)
+        jobs += [(s, cbars.get(s), None) for s in crypto_symbols()]
 
     for symbol, df, spy_up in jobs:
         try:
@@ -918,6 +1174,17 @@ def run_trading_cycle(clock, stocks: bool):
             state["symbol_errors"].pop(symbol, None)
         except Exception as e:
             report_symbol_error(symbol, e)
+    if stocks:   # last: these raise on failure so the main loop retries in 60s; one failing doesn't stop the other
+        errors = []
+        for step in (momentum_cycle, swing_cycle):
+            try:
+                step(ctx)
+            except Exception as e:
+                errors.append(e)
+        if len(errors) == 1:
+            raise errors[0]
+        if errors:   # both: one message, so the main loop's repeat filter can't hide the second behind the first
+            raise RuntimeError("; ".join(f"{type(e).__name__}: {e}" for e in errors))
 
 
 def report_symbol_error(symbol: str, error: Exception):
@@ -931,25 +1198,30 @@ def report_symbol_error(symbol: str, error: Exception):
 
 
 def flatten_all_once(now):
-    """End-of-day close-out of STOCKS (crypto is held overnight). Marked done only after every close works."""
+    """End-of-day close-out of intraday STOCK positions. Crypto and the swing ETFs are held overnight.
+    Marked done only after every close works."""
     if state["flatten_day"] == now.date():
         return
+    keep = swing_symbols()
     for o in open_orders():
-        if o.asset_class != AssetClass.CRYPTO and (o.side == OrderSide.BUY or is_orb(o)):
+        if (o.asset_class != AssetClass.CRYPTO and key(o.symbol) not in keep
+                and (o.side == OrderSide.BUY or is_orb(o))):
             trading_client.cancel_order_by_id(o.id)  # pending stock entries (ORB shorts are sells)
             refund_unfilled_risk(o)  # crypto keeps trading tonight on the same daily budget
-    failed = []
+    failed, closed = [], []
     for p in trading_client.get_all_positions():
-        if p.asset_class == AssetClass.CRYPTO:
+        if p.asset_class == AssetClass.CRYPTO or key(p.symbol) in keep:
             continue
         try:
             flatten(p.symbol)
+            closed.append(p.symbol)
         except Exception:
             failed.append(p.symbol)  # flatten() already alerted and re-placed the stop
     if failed:
         raise RuntimeError(f"EOD close failed for {', '.join(failed)}")
     state["flatten_day"], state["flatten_time"] = now.date(), now
-    notify("[EOD] Flattened all stock positions before the close.")
+    msg = f"[EOD] Closed {', '.join(closed)} before the close." if closed else "[EOD] No intraday stock positions to close."
+    (notify if closed else print)(msg)
 
 
 def maybe_send_daily_summary(now):
@@ -976,10 +1248,15 @@ def maybe_send_daily_summary(now):
     ]
     if pnls:
         lines.append(f"Best: ${max(pnls):+,.2f} | Worst: ${min(pnls):+,.2f}")
-    open_crypto = [p for p in trading_client.get_all_positions() if p.asset_class == AssetClass.CRYPTO]
-    for p in open_crypto:
-        lines.append(f"Holding {float(p.qty):g} {p.symbol} overnight (P&L ${float(p.unrealized_pl):+,.2f})")
-    lines.append(f"Qwen vetoes: {vetoes}" + (" | News check is DOWN" if state["news_down"] else ""))
+    held = trading_client.get_all_positions()
+    for p in held:
+        if p.asset_class == AssetClass.CRYPTO:
+            lines.append(f"Holding {float(p.qty):g} {p.symbol} overnight (P&L ${float(p.unrealized_pl):+,.2f})")
+        elif key(p.symbol) in swing_symbols():
+            lines.append(f"Swing: {float(p.qty):g} {p.symbol} ${float(p.market_value):,.0f} "
+                         f"(unrealized ${float(p.unrealized_pl):+,.2f})")
+    if llm_in_use():
+        lines.append(f"Qwen vetoes: {vetoes}" + (" | News check is DOWN" if state["news_down"] else ""))
     state["summary_day"] = today
     notify("\n".join(lines))
 
@@ -1006,18 +1283,45 @@ def seconds_until_next_bar() -> float:
     return period - (time.time() % period) + 10
 
 
+def check_config():
+    if config.STRATEGY not in ("none", "orb", "sma_rsi", "momentum"):
+        raise SystemExit(f"config.STRATEGY must be 'none', 'orb', 'sma_rsi' or 'momentum', not {config.STRATEGY!r}")
+    if config.STRATEGY == "momentum" and config.MOMENTUM_SYMBOL in swing_symbols():
+        raise SystemExit(f"{config.MOMENTUM_SYMBOL} is both MOMENTUM_SYMBOL and a swing symbol: an account holds one "
+                         f"position per symbol, so take it out of SWING_DIP_SYMBOLS / SWING_TREND_SYMBOL")
+    if config.SWING and config.SWING_TREND_WEIGHT + config.SWING_DIP_WEIGHT > 1 + 1e-9:
+        raise SystemExit("SWING_TREND_WEIGHT + SWING_DIP_WEIGHT is over 1: the swing rules would need margin")
+    if config.SWING and config.SWING_RUN_MINUTES_BEFORE_CLOSE <= config.FLATTEN_MINUTES_BEFORE_CLOSE:
+        raise SystemExit("SWING_RUN_MINUTES_BEFORE_CLOSE must be more than FLATTEN_MINUTES_BEFORE_CLOSE")
+
+
+def startup_banner() -> str:
+    parts = []
+    if config.SWING:
+        parts.append(f"swing ETFs ({config.SWING_TREND_SYMBOL} trend {config.SWING_TREND_WEIGHT:.0%}, RSI(2) dips "
+                     f"{config.SWING_DIP_WEIGHT:.0%} in {', '.join(config.SWING_DIP_SYMBOLS)}; decided "
+                     f"{config.SWING_RUN_MINUTES_BEFORE_CLOSE} min before the close)")
+    if config.STRATEGY == "momentum":
+        parts.append(f"day trading {config.MOMENTUM_SYMBOL} (intraday momentum, {config.MOMENTUM_SIZE:g}x, "
+                     f"decided every {config.MOMENTUM_CHECK_MINUTES} min from 10:00)")
+    elif config.STRATEGY != "none":
+        parts.append(f"intraday stocks ({config.STRATEGY})")
+    if crypto_symbols():
+        parts.append(f"{', '.join(crypto_symbols())} 24/7")
+    return f"=== Bot started (paper): {'; '.join(parts) or 'nothing enabled in config.py'} === Press 'q' or 's' to stop."
+
+
 def main():
+    check_config()
     db.init()
     stream = TradingStream(API_KEY, SECRET_KEY, paper=True)
     stream.subscribe_trade_updates(on_trade_update)
     threading.Thread(target=stream.run, daemon=True).start()
 
-    notify(f"=== Bot started (paper): stocks ({config.STRATEGY}) in market hours"
-           + (f", {', '.join(config.CRYPTO_WATCHLIST)} 24/7" if config.CRYPTO_WATCHLIST else "")
-           + " === Press 'q' or 's' to stop.")
-    if config.USE_LLM_VETO:
+    notify(startup_banner())
+    if llm_in_use():
         check_ollama()
-    if config.STRATEGY != "orb" and config.USE_EARNINGS_CHECK and not earnings_check_on():
+    if config.STRATEGY == "sma_rsi" and config.USE_EARNINGS_CHECK and not earnings_check_on():
         notify("[!] Earnings check is OFF: no ALPHAVANTAGE_API_KEY in .env (free key: alphavantage.co). "
                "Only Qwen's headline check will catch earnings.")
     while True:
@@ -1033,7 +1337,7 @@ def main():
             maybe_send_daily_summary(now)
             orb_maybe_prepare(clock)  # once a day before the open; raises on failure -> retried in 60s
 
-            if stocks or config.CRYPTO_WATCHLIST:
+            if stocks or crypto_symbols():
                 run_trading_cycle(clock, stocks)
             if not clock.is_open:
                 print(f"Stock market closed. Next open {clock.next_open.astimezone():%Y-%m-%d %H:%M}.")
