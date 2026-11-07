@@ -3,29 +3,35 @@ import math
 from collections import defaultdict, deque
 import pandas as pd
 
+import config
+
+
+LONG_ONLY = {s.replace("/", "") for s in config.CRYPTO_WATCHLIST}  # Alpaca can't short crypto
+
 
 def round_trips(fills) -> list[float]:
     """fills: iterable of (symbol, side, qty, price, order_id) in time order.
-    FIFO-matches sells to buys; returns realized P&L per sell order.
-    Sells with no matching logged buy (e.g. positions opened before logging) are ignored."""
-    lots = defaultdict(deque)
+    FIFO-matches each fill against open lots on the other side (longs and shorts); returns realized P&L per
+    closing order. A sell with nothing to close opens a short, except in LONG_ONLY symbols, where it can only be
+    a position opened before logging began and is ignored."""
+    lots = defaultdict(deque)   # symbol -> [signed qty, price]; all lots of a symbol share one sign
     pnl_by_order = {}
     for symbol, side, qty, price, order_id in fills:
-        if side == "buy":
-            lots[symbol].append([qty, price])
-            continue
+        sign = 1 if side == "buy" else -1
         remaining, pnl, matched = qty, 0.0, False
-        while remaining > 1e-9 and lots[symbol]:
+        while remaining > 1e-9 and lots[symbol] and lots[symbol][0][0] * sign < 0:
             lot = lots[symbol][0]
-            take = min(lot[0], remaining)
-            pnl += take * (price - lot[1])
-            lot[0] -= take
+            take = min(abs(lot[0]), remaining)
+            pnl += take * (price - lot[1]) * (1 if lot[0] > 0 else -1)
+            lot[0] += take * sign
             remaining -= take
             matched = True
-            if lot[0] <= 1e-9:
+            if abs(lot[0]) <= 1e-9:
                 lots[symbol].popleft()
         if matched:
             pnl_by_order[order_id] = pnl_by_order.get(order_id, 0.0) + pnl
+        if remaining > 1e-9 and not (sign < 0 and symbol in LONG_ONLY):
+            lots[symbol].append([remaining * sign, price])
     return list(pnl_by_order.values())
 
 
