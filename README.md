@@ -94,8 +94,8 @@ TELEGRAM_CHAT_ID=...
 4. **Size**: yesterday's equity / today's open, in whole shares (short sales can't be fractional), fixed for the
    day. `MOMENTUM_SIZE` scales it; the paper's 19.6%/yr headline used up to 4x borrowed money, which is not tested
    here at the bot's costs.
-5. **15:50**: the close-out closes it. If the bot was off then, the position left over is closed the next morning,
-   before the first decision.
+5. **15:50**: the close-out closes it. If the bot was off then, the position left over is closed the next morning
+   if the bot is running before 10:00; otherwise the first check trades it to that check's target.
 
 - **Missed checks are skipped.** If the bot isn't running at a check (within 5 minutes of it), nothing happens until
   the next one. Stale or missing data raises an alert and is retried every minute while the check is still due.
